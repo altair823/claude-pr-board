@@ -1,0 +1,38 @@
+# Gitea 공용 러너(altair823-org/gitea-runner)의 host 라벨에서 돈다.
+# 모든 push에서 mod 검증과 시험을 돌린다. main에서 시험이 통과하면 scripts/ci-release.sh가 다음 버전을
+# release 브랜치에 올리고 v<버전> 태그와 Gitea 릴리스를 만든다. 설치본은 release 브랜치만 받는다.
+name: ci
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['**.md', 'docs/**']
+
+jobs:
+  test:
+    runs-on: host
+    steps:
+      - uses: builtin:checkout
+      # 개발에 쓰는 Claude Code와 같은 버전으로 시험한다. 올릴 때는 이 줄도 함께 바꾼다.
+      - name: Claude Code 설치
+        run: |
+          npm install -g --prefix "$HOME/.claude-code" --silent @anthropic-ai/claude-code@2.1.325
+          echo "$HOME/.claude-code/bin" >> "$GITHUB_PATH"
+      - run: claude --version
+      - run: claude plugin validate .
+      - run: claude plugin test .
+
+  release:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: host
+    # 두 push가 연달아 와도 같은 버전을 두 번 만들지 않도록 차례로 돈다.
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: builtin:checkout
+        with:
+          fetch-depth: 0
+      - run: scripts/ci-release.sh
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
