@@ -48,9 +48,39 @@ async function locate($: EngineInterface): Promise<Board> {
   return base
 }
 
-async function load($: EngineInterface): Promise<Board> {
+// 같은 저장소를 보는 세션들이 조회 결과를 나눠 쓰는 파일. 세션이 몇 개든 저장소마다 한 세션분만 조회한다.
+// ponytail: 두 세션의 주기가 같은 순간에 돌아오면 둘 다 조회할 수 있다. 잦아지면 조회 중 표시 파일을 둔다.
+async function cacheFile($: EngineInterface, b: Board): Promise<string | undefined> {
+  const home = (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined))
+  return home && b.host && b.repo ? `${home}/.cache/claude-pr-board/${b.host}/${b.repo}.json` : undefined
+}
+const mtimeOf = ($: EngineInterface, file: string) => $.fs.stat(file).then(st => st.mtimeMs, () => 0)
+// 이 세션이 마지막으로 쓰거나 읽은 공유 파일의 수정 시각. 더 새 파일이 보이면 다른 세션이 읽은 것이다.
+let seenMtime = 0
+
+// 대기나 실행 중인 CI가 있으면 짧게, 없으면 길게 기다린다.
+const dueIn = (b: Board, now: number) => (!b.error && items(b, now).some(it => ciOf(it.runs, now).active) ? ACTIVE_MS : IDLE_MS)
+
+async function readShared($: EngineInterface, file: string, base: Board): Promise<Board | undefined> {
+  const mtime = await mtimeOf($, file)
+  if (!mtime) return undefined
+  const b = await $.fs.read(file).then(t => JSON.parse(t) as Board, () => undefined)
+  // 쓰는 도중에 읽어 깨졌거나 다른 저장소 것이면 쓰지 않는다.
+  if (b?.repo !== base.repo || b.host !== base.host || !Array.isArray(b.pulls) || !Array.isArray(b.runs) || typeof b.fetched !== 'number') return undefined
+  seenMtime = mtime
+  return { ...b, branch: base.branch }
+}
+
+// force가 아니면 다른 세션이 최근에 읽은 결과를 먼저 쓴다. push 뒤나 r을 누르면 force로 서버에서 읽는다.
+async function load($: EngineInterface, force = false): Promise<Board> {
   const base = await locate($)
   if (base.error) return base
+  const file = await cacheFile($, base)
+  if (!force && file) {
+    const shared = await readShared($, file, base)
+    const now = await $.clock.now()
+    if (shared && now - shared.fetched < dueIn(shared, now) - 100) return shared
+  }
   const R = `/repos/${base.repo}`
   try {
     const [pulls, runs] = await Promise.all([
@@ -86,6 +116,10 @@ async function load($: EngineInterface): Promise<Board> {
           if (done) jobMemo.set(r.id, jobs)
         }),
     )
+    if (file) {
+      await $.fs.write(file, JSON.stringify({ ...next, branch: '' })).catch(() => {})
+      seenMtime = await mtimeOf($, file)
+    }
     return next
   } catch (err) {
     return { ...base, error: err instanceof Error ? err.message : String(err) }
@@ -120,10 +154,12 @@ function notify($: EngineInterface, b: Board, now: number) {
 // 갱신이 겹치면 하나로 합친다. 도는 중에 다시 요청되면 끝난 뒤 한 번 더 읽는다.
 let busy = false
 let again = false
+let forced = false
 let lastEnd = 0
 // 마지막으로 읽은 디렉터리. /cd로 바뀌면 주기를 기다리지 않고 다시 읽는다(/cd에는 CwdChanged 훅이 불리지 않는다).
 let lastCwd = ''
-async function refresh($: EngineInterface) {
+async function refresh($: EngineInterface, force = false) {
+  forced ||= force
   if (busy) {
     again = true
     return
@@ -132,8 +168,10 @@ async function refresh($: EngineInterface) {
   try {
     do {
       again = false
+      const f = forced
+      forced = false
       lastCwd = await $.session.cwd()
-      const next = await load($)
+      const next = await load($, f)
       await update($, board, () => next)
       lastEnd = await $.clock.now()
       notify($, next, lastEnd)
@@ -151,15 +189,16 @@ const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id
 const ACTIVE_MS = 15_000
 const IDLE_MS = 300_000
 
-// 타이머는 2초마다 깨어나 패널 상태와 디렉터리가 바뀌었는지만 본다(원격을 읽지 않는다).
+// 타이머는 2초마다 깨어나 패널 상태, 디렉터리, 공유 파일이 바뀌었는지만 본다(원격을 읽지 않는다).
 async function tick($: EngineInterface) {
   const p = (await $.ui.panes()).find(x => x.id === PANE)
   const where: PaneState = !p ? 'closed' : p.isShown ? 'shown' : 'hidden'
   if ((await read($, pane)) !== where) await update($, pane, () => where)
   if (!p) return
-  const active = [...(seen?.values() ?? [])].some(x => x.active)
-  const moved = (await $.session.cwd()) !== lastCwd
-  if (moved || (await $.clock.now()) - lastEnd >= (active ? ACTIVE_MS : IDLE_MS) - 100) await refresh($)
+  const [b, now, cwd] = await Promise.all([read($, board), $.clock.now(), $.session.cwd()])
+  const file = b.error ? undefined : await cacheFile($, b)
+  const shared = file !== undefined && (await mtimeOf($, file)) > seenMtime
+  if (cwd !== lastCwd || shared || now - lastEnd >= dueIn(b, now) - 100) await refresh($)
 }
 
 let ticker: { cancel: () => void } | undefined
@@ -247,7 +286,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'pr-board' }, async $ => {
     await $.store.set(OPENED, true).catch(() => {})
-    void refresh($).catch(() => {})
+    void refresh($, true).catch(() => {})
     await open($, true)
     return { text: 'PR 패널을 열었습니다. Esc로 입력창에 돌아옵니다.' }
   })
@@ -274,9 +313,9 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (e.tool === 'Bash' && REMOTE_CMD.test(e.command) && (await isOpen($).catch(() => false))) {
-      void refresh($).catch(() => {})
+      void refresh($, true).catch(() => {})
       try {
-        $.clock.after(3000, () => void refresh($).catch(() => {}))
+        $.clock.after(3000, () => void refresh($, true).catch(() => {}))
       } catch {}
     }
     return ran
@@ -352,7 +391,7 @@ export const register: Register = on => {
         {hasActions && (
           <Box flexDirection="row">
             {act('1', '리뷰 반영', () => ask($, 'review'))}{gap}{act('2', 'CI 고치기', () => ask($, 'fix'))}{gap}
-            {act('3', '머지', () => ask($, 'merge'))}{gap}{act('r', '새로 고침', () => refresh($))}
+            {act('3', '머지', () => ask($, 'merge'))}{gap}{act('r', '새로 고침', () => refresh($, true))}
           </Box>
         )}
         {hasActions && <Text>{segs(fit(hint, [], cols))}</Text>}

@@ -298,6 +298,46 @@ test('패널을 열지 않은 세션은 원격을 읽지 않고, 열린 동안 C
   expect(lists()).toBe(4)
 })
 
+test('같은 저장소를 보는 다른 세션이 최근에 읽은 결과가 있으면 서버에 묻지 않고 그것을 쓴다', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const seen = stubs(on, fixture(), undefined, true)
+  // 세션들이 함께 쓰는 파일을 메모리에 둔다
+  const files = new Map<string, { text: string; mtime: number }>()
+  const FILE = '/home/me/.cache/claude-pr-board/gitea.example.com/org/app.json'
+  on('env.get', (_: unknown, e: { name: string }) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
+  on('fs.stat', (_: unknown, e: { path: string }) => {
+    const f = files.get(e.path)
+    return f ? { value: { kind: 'file', size: f.text.length, mtimeMs: f.mtime, isLink: false } } : { deny: 'ENOENT' }
+  })
+  on('fs.read', (_: unknown, e: { path: string }) => (files.has(e.path) ? { value: files.get(e.path)!.text } : { deny: 'ENOENT' }))
+  on('fs.write', (_: unknown, e: { path: string; text: string }) => (files.set(e.path, { text: e.text, mtime: clock.now() }), { value: undefined }))
+  const lists = () => seen.api.filter(p => p.endsWith('/pulls?state=open&limit=50')).length
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect(lists()).toBe(1)
+  expect(files.has(FILE)).toBe(true)
+
+  // 다른 세션이 방금 새로 읽어 파일을 고쳤다
+  const other = JSON.parse(files.get(FILE)!.text)
+  other.pulls[0].title = '다른 세션이 읽은 제목'
+  other.fetched = clock.now() + 1000
+  files.set(FILE, { text: JSON.stringify(other), mtime: clock.now() + 1000 })
+  await clock.advance(2000)
+  expect(lists()).toBe(1)
+  const ui = await $.ui.mount(PANE('terminal'))
+  expect((await ui.find({ key: 'r:pr:12' }))?.text).toMatch(/다른 세션이 읽은 제목/)
+  await ui.unmount()
+
+  // 파일이 오래되면(CI가 도는 중이라 15초) 이 세션이 읽는다
+  await clock.advance(16_000)
+  expect(lists()).toBe(2)
+  // push 뒤에는 파일이 새것이어도 서버에서 읽는다
+  await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+  await clock.settle()
+  expect(lists()).toBe(3)
+})
+
 test('CI 요약은 보여 줄 것이 없으면 비운다', () => {
   expect(bandLine([], NOW)).toBeUndefined()
 })
