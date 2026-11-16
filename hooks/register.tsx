@@ -30,16 +30,26 @@ async function api($: EngineInterface, path: string): Promise<unknown> {
   return parseJson(out.stdout)
 }
 
-async function load($: EngineInterface): Promise<Board> {
+// git만 확인한다(네트워크를 쓰지 않는다). 오류가 없으면 PR과 CI를 읽을 수 있는 저장소다.
+async function locate($: EngineInterface): Promise<Board> {
   const git = (args: string[]) => $.process.run(['git', ...args], { env: QUIET }).catch(() => undefined)
-  const [remote, head] = await Promise.all([git(['remote', 'get-url', 'origin']), git(['rev-parse', '--abbrev-ref', 'HEAD'])])
-  const branch = head?.exitCode === 0 ? head.stdout.trim() : ''
-  if (remote?.exitCode !== 0) return { ...EMPTY, branch, error: 'origin 원격이 있는 git 저장소에서 PR과 CI를 보여 줍니다' }
+  // branch --show-current는 커밋이 없는 저장소에서도 성공하고, 저장소가 아니면 실패한다. 분리된 HEAD에서는 빈 줄이다.
+  const [head, remote] = await Promise.all([git(['branch', '--show-current']), git(['remote', 'get-url', 'origin'])])
+  if (!head) return { ...EMPTY, error: 'git을 실행하지 못했습니다' }
+  if (head.exitCode !== 0) return { ...EMPTY, error: 'git 저장소가 아닙니다' }
+  const branch = head.stdout.trim()
+  if (remote?.exitCode !== 0) return { ...EMPTY, branch, error: 'origin 원격이 없습니다. origin이 Gitea 저장소를 가리키면 PR과 CI를 보여 줍니다' }
   const where = parseRemote(remote.stdout)
   if (!where) return { ...EMPTY, branch, error: `원격 주소를 읽지 못했습니다: ${remote.stdout.trim()}` }
   const base: Board = { ...EMPTY, ...where, branch }
   if (where.host === 'github.com') return { ...base, error: 'GitHub 저장소는 아직 지원하지 않습니다. 지금은 Gitea 저장소만 보여 줍니다' }
-  const R = `/repos/${where.repo}`
+  return base
+}
+
+async function load($: EngineInterface): Promise<Board> {
+  const base = await locate($)
+  if (base.error) return base
+  const R = `/repos/${base.repo}`
   try {
     const [pulls, runs] = await Promise.all([
       api($, `${R}/pulls?state=open&limit=50`).then(parsePulls),
@@ -81,10 +91,13 @@ async function load($: EngineInterface): Promise<Board> {
 }
 
 // 줄마다 지난번에 본 CI 진행 여부와 리뷰 결과. 처음 읽을 때(undefined)는 알림을 띄우지 않는다.
+// 다른 저장소로 옮기면 처음부터 다시 본다(두 저장소의 같은 PR 번호를 같은 줄로 보지 않게).
 let seen: Map<string, { active: boolean; review: string }> | undefined
+let seenRepo = ''
 
 // 상태줄을 고치고, 대기나 실행이 끝난 줄과 새 리뷰 결과를 알린다. 패널이 다른 탭에 가려져 있어도 알 수 있게 한다.
 function notify($: EngineInterface, b: Board, now: number) {
+  if (b.repo !== seenRepo) [seen, seenRepo] = [undefined, b.repo]
   const list = b.error ? [] : items(b, now)
   $.ui.status(statusLine(list, now))
   const next = new Map<string, { active: boolean; review: string }>()
@@ -107,6 +120,8 @@ function notify($: EngineInterface, b: Board, now: number) {
 let busy = false
 let again = false
 let lastEnd = 0
+// 마지막으로 읽은 디렉터리. /cd로 바뀌면 주기를 기다리지 않고 다시 읽는다(/cd에는 CwdChanged 훅이 불리지 않는다).
+let lastCwd = ''
 async function refresh($: EngineInterface) {
   if (busy) {
     again = true
@@ -116,6 +131,7 @@ async function refresh($: EngineInterface) {
   try {
     do {
       again = false
+      lastCwd = await $.session.cwd()
       const next = await load($)
       await update($, board, () => next)
       lastEnd = await $.clock.now()
@@ -126,10 +142,20 @@ async function refresh($: EngineInterface) {
   }
 }
 
-// ponytail: 대기나 실행 중인 CI가 있으면 10초, 없으면 30초마다 읽는다. Gitea 부하가 문제가 되면 웹훅이나 더 긴 주기로 바꾼다.
+const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE)
+
+// 원격 서버 부하를 줄이려고 패널을 연 세션에서만 읽는다(다른 탭에 가려져 있어도 연 것이다).
+// 대기나 실행 중인 CI가 있으면 15초, 없으면 5분마다 읽고, push 같은 명령 뒤에는 바로 읽는다.
+// ponytail: 같은 저장소를 연 세션이 여럿이면 각자 읽는다. 부하가 문제가 되면 $.store로 결과를 나눠 쓴다.
+const ACTIVE_MS = 15_000
+const IDLE_MS = 300_000
+
+// 타이머는 2초마다 깨어나 패널이 열려 있는지와 디렉터리가 바뀌었는지만 본다(원격을 읽지 않는다).
 async function tick($: EngineInterface) {
+  if (!(await isOpen($))) return
   const active = [...(seen?.values() ?? [])].some(x => x.active)
-  if ((await $.clock.now()) - lastEnd >= (active ? 10_000 : 30_000) - 100) await refresh($)
+  const moved = (await $.session.cwd()) !== lastCwd
+  if (moved || (await $.clock.now()) - lastEnd >= (active ? ACTIVE_MS : IDLE_MS) - 100) await refresh($)
 }
 
 let ticker: { cancel: () => void } | undefined
@@ -202,11 +228,14 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: 'pr-board', description: 'PR과 CI 상태 패널 열기' })
-    // 네트워크를 기다리느라 세션 시작이 늦어지지 않게 끝을 기다리지 않는다.
-    void refresh($).catch(() => {})
-    if ((await $.store.get(OPENED).catch(() => undefined)) === true) void open($).catch(() => {})
+    // git-graph처럼 보여 줄 수 있는 저장소에서만 연다. 저장소가 아니면 /pr-board로 직접 열 때만 안내가 보인다.
+    // 네트워크를 기다리느라 세션 시작이 늦어지지 않게 읽기는 끝을 기다리지 않는다.
+    if ((await $.store.get(OPENED).catch(() => undefined)) === true && !(await locate($)).error) {
+      void open($).catch(() => {})
+      void refresh($).catch(() => {})
+    }
     ticker?.cancel()
-    ticker = $.clock.every(10_000, () => void tick($).catch(() => {}))
+    ticker = $.clock.every(2000, () => void tick($).catch(() => {}))
     return started
   })
 
@@ -217,16 +246,19 @@ export const register: Register = on => {
     return { text: 'PR 패널을 열었습니다. Esc로 입력창에 돌아옵니다.' }
   })
 
-  // 사람이 직접 닫으면 다음 세션에는 열지 않는다.
+  // 사람이 직접 닫으면 다음 세션에는 열지 않는다. 닫으면 더 읽지 않으므로 상태줄도 비운다.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     if (e.origin.kind === 'person') await $.store.set(OPENED, false).catch(() => {})
-    return next(e)
+    const done = await next(e)
+    seen = undefined
+    $.ui.status(undefined)
+    return done
   })
 
   // push나 PR 작업 뒤에는 바로 읽고, CI 실행이 만들어질 때쯤 한 번 더 읽는다.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
-    if (e.tool === 'Bash' && REMOTE_CMD.test(e.command)) {
+    if (e.tool === 'Bash' && REMOTE_CMD.test(e.command) && (await isOpen($).catch(() => false))) {
       void refresh($).catch(() => {})
       try {
         $.clock.after(3000, () => void refresh($).catch(() => {}))
@@ -253,10 +285,11 @@ export const register: Register = on => {
     const segs = (list: Seg[]) => list.map(s => <Text color={s.color} dimColor={s.dim} weight={s.bold && 'bold'}>{s.t}</Text>)
     const rule = <Text dimColor>{'─'.repeat(cols)}</Text>
     const header = fit([{ t: b.repo || '저장소 확인 중', bold: true }], [{ t: b.fetched ? `갱신 ${dur(now - b.fetched)} 전` : '불러오는 중', dim: true }], cols)
+    // 오류일 때 "불러오는 중"은 맞지 않는다. 원격을 읽었으면 저장소 이름만 두고, 아니면 안내만 그린다.
     if (b.error) {
       return (
         <Box flexDirection="column">
-          <Text>{segs(header)}</Text>
+          {b.repo && <Text>{segs(fit([{ t: b.repo, bold: true }], [], cols))}</Text>}
           <Text dimColor>{b.error}</Text>
         </Box>
       )
@@ -286,7 +319,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Text>{segs(header)}</Text>
         {rule}
-        {!list.length && <Text dimColor>열린 PR이 없고, 하루 안에 CI가 돈 브랜치도 없습니다</Text>}
+        {!list.length && b.fetched > 0 && <Text dimColor>열린 PR이 없고, 하루 안에 CI가 돈 브랜치도 없습니다</Text>}
         {shown.map(it => {
           const ci = ciOf(it.runs, now)
           const review = it.pull && reviewOf(it.pull)
