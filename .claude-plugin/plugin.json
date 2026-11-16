@@ -1,6 +1,6 @@
 {
   "name": "pr-board",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "패널에 원격 저장소의 열린 PR과 브랜치별 CI 상태를 보여 준다",
   "author": {
     "name": "altair823"
