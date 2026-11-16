@@ -44,8 +44,11 @@ export type Board = { host: string; repo: string; branch: string; pulls: Pull[];
 // cur: 커서가 있는 줄의 key
 export type View = { cur: string }
 
+// 이 세션의 PR 패널: 닫힘, 열렸지만 다른 탭에 가려짐, 화면에 보임
+export type PaneState = 'closed' | 'hidden' | 'shown'
+
 declare module 'claude-code' {
   interface PluginState {
-    'pr-board': { board: Shaped<Board>; view: Shaped<View> }
+    'pr-board': { board: Shaped<Board>; view: Shaped<View>; pane: PaneState }
   }
 }

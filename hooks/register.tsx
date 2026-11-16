@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Board, Job, Review, View } from '../types'
-import { ciOf, dur, fit, items, jobLine, jobsOf, labelOf, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, reviewOf, statusLine } from './board'
+import type { Board, Job, PaneState, Review, View } from '../types'
+import { bandLine, ciOf, dur, fit, items, jobLine, jobsOf, labelOf, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, reviewOf } from './board'
 import type { Item, Seg } from './board'
 
 const PANE = 'pr-board'
@@ -11,6 +11,8 @@ const EMPTY: Board = { host: '', repo: '', branch: '', pulls: [], runs: [], fetc
 // 저장 형태가 바뀌면 shape 값을 올린다. 이전 버전이 저장한 값은 버려진다.
 const board = atom({ plugin: 'pr-board', key: 'board' } as const, EMPTY, { shape: 'board-1' })
 const view = atom({ plugin: 'pr-board', key: 'view' } as const, { cur: '' } as View, { shape: 'view-1' })
+// 패널이 가려져 있을 때만 입력창 위에 CI 요약을 그린다. 타이머가 2초마다 고친다.
+const pane = atom({ plugin: 'pr-board', key: 'pane' } as const, 'closed' as PaneState)
 // 사람이 /pr-board로 연 뒤 직접 닫지 않았으면 다음 세션에도 연다($.store에 남긴다).
 const OPENED = 'opened'
 // 인증이 없을 때 입력을 기다리며 멈추지 않게 한다.
@@ -95,11 +97,10 @@ async function load($: EngineInterface): Promise<Board> {
 let seen: Map<string, { active: boolean; review: string }> | undefined
 let seenRepo = ''
 
-// 상태줄을 고치고, 대기나 실행이 끝난 줄과 새 리뷰 결과를 알린다. 패널이 다른 탭에 가려져 있어도 알 수 있게 한다.
+// 대기나 실행이 끝난 줄과 새 리뷰 결과를 알린다. 패널이 다른 탭에 가려져 있어도 알 수 있게 한다.
 function notify($: EngineInterface, b: Board, now: number) {
   if (b.repo !== seenRepo) [seen, seenRepo] = [undefined, b.repo]
   const list = b.error ? [] : items(b, now)
-  $.ui.status(statusLine(list, now))
   const next = new Map<string, { active: boolean; review: string }>()
   for (const it of list) {
     const ci = ciOf(it.runs, now)
@@ -150,9 +151,12 @@ const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id
 const ACTIVE_MS = 15_000
 const IDLE_MS = 300_000
 
-// 타이머는 2초마다 깨어나 패널이 열려 있는지와 디렉터리가 바뀌었는지만 본다(원격을 읽지 않는다).
+// 타이머는 2초마다 깨어나 패널 상태와 디렉터리가 바뀌었는지만 본다(원격을 읽지 않는다).
 async function tick($: EngineInterface) {
-  if (!(await isOpen($))) return
+  const p = (await $.ui.panes()).find(x => x.id === PANE)
+  const where: PaneState = !p ? 'closed' : p.isShown ? 'shown' : 'hidden'
+  if ((await read($, pane)) !== where) await update($, pane, () => where)
+  if (!p) return
   const active = [...(seen?.values() ?? [])].some(x => x.active)
   const moved = (await $.session.cwd()) !== lastCwd
   if (moved || (await $.clock.now()) - lastEnd >= (active ? ACTIVE_MS : IDLE_MS) - 100) await refresh($)
@@ -228,6 +232,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: 'pr-board', description: 'PR과 CI 상태 패널 열기' })
+    // 0.1.1까지는 CI 요약을 상태줄에 두었다. 다시 불러온 세션에 남은 줄을 지운다.
+    $.ui.status(undefined)
     // git-graph처럼 보여 줄 수 있는 저장소에서만 연다. 저장소가 아니면 /pr-board로 직접 열 때만 안내가 보인다.
     // 네트워크를 기다리느라 세션 시작이 늦어지지 않게 읽기는 끝을 기다리지 않는다.
     if ((await $.store.get(OPENED).catch(() => undefined)) === true && !(await locate($)).error) {
@@ -246,13 +252,22 @@ export const register: Register = on => {
     return { text: 'PR 패널을 열었습니다. Esc로 입력창에 돌아옵니다.' }
   })
 
-  // 사람이 직접 닫으면 다음 세션에는 열지 않는다. 닫으면 더 읽지 않으므로 상태줄도 비운다.
+  // 사람이 직접 닫으면 다음 세션에는 열지 않는다. 닫으면 더 읽지 않으므로 입력창 위 요약도 바로 뺀다.
   on('ui.close', { id: PANE }, async ($, e, next) => {
     if (e.origin.kind === 'person') await $.store.set(OPENED, false).catch(() => {})
     const done = await next(e)
     seen = undefined
-    $.ui.status(undefined)
+    await update($, pane, () => 'closed')
     return done
+  })
+
+  // 패널이 다른 탭에 가려져 있을 때 입력창 위에 CI 요약 한 줄을 그린다. 상태줄은 Claude Code가 앞에 ⚠를 붙여 쓰지 않는다.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const [b, where, now] = await Promise.all([read($, board), read($, pane), $.clock.now()])
+    const line = where === 'hidden' && !b.error && !e.props.hasSurvey ? bandLine(items(b, now), now) : undefined
+    if (!line) return next(e)
+    const { Text } = $.ui.resolve(e)
+    return <Text>{fit(line, [], Math.max(10, e.props.bodyColumns - 1)).map(s => <Text color={s.color} dimColor={s.dim}>{s.t}</Text>)}</Text>
   })
 
   // push나 PR 작업 뒤에는 바로 읽고, CI 실행이 만들어질 때쯤 한 번 더 읽는다.

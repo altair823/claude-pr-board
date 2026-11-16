@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { ciOf, items, parseRemote, parseRuns, reviewOf, statusLine } from '../hooks/board'
+import { bandLine, ciOf, items, parseRemote, parseRuns, reviewOf } from '../hooks/board'
 import type { Board, Pull } from '../types'
 
 // 시험 환경에는 있지만 타입 정의(lib)에는 없는 전역 함수
@@ -50,8 +50,8 @@ const fixture = () => ({
 // timers가 true면 시계를 직접 다루지 않는다(시험이 mock.clock을 쓴다).
 function stubs(on: any, data = fixture(), remote: string | null = 'https://gitea.example.com/org/app.git', timers = false) {
   // 기본은 사람이 예전에 /pr-board로 패널을 연 상태다. 패널이 열려 있는 동안만 원격을 읽는다.
-  const seen = { toasts: [] as string[], status: [] as unknown[], filled: [] as string[], api: [] as string[], opened: 0, closed: false, remote, cwd: '/repo', store: { opened: true } as Record<string, unknown> }
-  on('ui.panes', () => ({ value: seen.opened && !seen.closed ? [{ id: 'pr-board', title: 'PR', isShown: true, isFocused: false }] : [] }))
+  const seen = { toasts: [] as string[], status: [] as unknown[], filled: [] as string[], api: [] as string[], opened: 0, closed: false, shown: true, remote, cwd: '/repo', store: { opened: true } as Record<string, unknown> }
+  on('ui.panes', () => ({ value: seen.opened && !seen.closed ? [{ id: 'pr-board', title: 'PR', isShown: seen.shown, isFocused: false }] : [] }))
   on('session.cwd', () => ({ value: seen.cwd }))
   on('store.get', (_: unknown, e: { key: string }) => ({ value: seen.store[e.key] }))
   on('store.set', (_: unknown, e: { key: string; value: unknown }) => ((seen.store[e.key] = e.value), { value: undefined }))
@@ -82,6 +82,19 @@ function stubs(on: any, data = fixture(), remote: string | null = 'https://gitea
     return ok('404 page not found')
   })
   return seen
+}
+
+// 입력창 위 줄. 그린 것이 없으면 undefined
+const BAND = {
+  plugin: 'pr-board', surface: 'terminal', component: 'AbovePrompt',
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 10, bodyColumns: 80, scroll: { offset: 0, bodyRows: 9 }, view: {} },
+} as const
+async function band($: any): Promise<string | undefined> {
+  const ui = await $.ui.mount(BAND)
+  const t = await ui.find({ type: 'Text', text: /^CI / })
+  await ui.unmount()
+  // 줄 끝까지 공백으로 채워 그린다
+  return t?.text.trimEnd()
 }
 
 const PANE = (surface: 'terminal' | 'desktop') => ({
@@ -150,8 +163,6 @@ test('패널에 PR과 브랜치의 CI, 리뷰를 그리고 커서 줄의 작업�
   expect((await ui.find({ type: 'Text', text: /^main {2}c{7}/ }))?.text).toMatch(/실행 #28$/)
   expect((await ui.find({ type: 'Text', text: /release/ }))?.text.trim()).toBe('- release  건너뜀')
   await ui.unmount()
-  // 상태줄에는 도는 중이거나 기다리는 줄만
-  expect(JSON.stringify(seen.status.at(-1))).toContain('CI ▶ #12 7분  ⏳ feat/queue 대기 12분')
   // 끝난 실행의 작업은 다시 읽지 않는다
   const before = seen.api.filter(p => p.endsWith('/28/jobs')).length
   await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
@@ -222,22 +233,38 @@ test('git 저장소가 아니면 안내만 그리고, 세션을 시작할 때 �
   await ui.unmount()
 })
 
-test('/cd로 저장소 밖으로 옮기면 바로 다시 읽어 안내로 바꾸고 상태줄을 비운다', async ($, on) => {
+test('패널이 다른 탭에 가려지면 입력창 위에 CI 요약을 그리고, 보이거나 닫히면 뺀다', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const seen = stubs(on, fixture(), undefined, true)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(2000)
+  expect(await band($)).toBeUndefined()
+  seen.shown = false
+  await clock.advance(2000)
+  expect(await band($)).toBe('CI ▶ #12 7분  ⏳ feat/queue 대기 12분')
+  seen.closed = true
+  await clock.advance(2000)
+  expect(await band($)).toBeUndefined()
+  // 상태줄은 쓰지 않는다(이전 버전이 남긴 줄을 지우는 호출뿐)
+  expect(seen.status).toEqual([{ text: undefined }])
+})
+
+test('/cd로 저장소 밖으로 옮기면 바로 다시 읽어 안내로 바꾸고 CI 요약을 뺀다', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const seen = stubs(on, fixture(), undefined, true)
+  seen.shown = false
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await clock.settle()
-  expect(JSON.stringify(seen.status.at(-1))).toContain('CI ▶')
   seen.remote = null
   await clock.advance(2000)
-  // 디렉터리가 그대로면 30초 주기 전에는 다시 읽지 않는다
-  expect(JSON.stringify(seen.status.at(-1))).toContain('CI ▶')
+  // 디렉터리가 그대로면 주기 전에는 다시 읽지 않는다
+  expect(await band($)).toMatch(/^CI ▶/)
   seen.cwd = '/'
   await clock.advance(2000)
   const ui = await $.ui.mount(PANE('terminal'))
   expect((await ui.find({ type: 'Text', text: /저장소/ }))?.text).toBe('git 저장소가 아닙니다')
   await ui.unmount()
-  expect(seen.status.at(-1)).toEqual({ text: undefined })
+  expect(await band($)).toBeUndefined()
 })
 
 test('패널을 열지 않은 세션은 원격을 읽지 않고, 열린 동안 CI가 없으면 5분마다 읽는다', async ($, on) => {
@@ -249,7 +276,6 @@ test('패널을 열지 않은 세션은 원격을 읽지 않고, 열린 동안 C
   await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
   await clock.advance(600_000)
   expect(seen.api).toEqual([])
-  expect(seen.status).toEqual([])
 
   await $.command.run({ command: 'pr-board', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
   await clock.settle()
@@ -272,6 +298,6 @@ test('패널을 열지 않은 세션은 원격을 읽지 않고, 열린 동안 C
   expect(lists()).toBe(4)
 })
 
-test('statusLine은 보여 줄 것이 없으면 비운다', () => {
-  expect(statusLine([], NOW)).toBeUndefined()
+test('CI 요약은 보여 줄 것이 없으면 비운다', () => {
+  expect(bandLine([], NOW)).toBeUndefined()
 })

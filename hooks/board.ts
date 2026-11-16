@@ -211,17 +211,17 @@ export function jobLine(j: Job, runs: Run[], now: number): Seg[] {
 export const labelOf = (it: Item): Seg[] =>
   it.pull ? [{ t: `#${it.num}`, color: 'yellow' }, { t: ` ${it.title}` }] : [{ t: it.branch, color: 'magenta' }, { t: `  ${it.title}`, dim: true }]
 
-// 상태줄: 대기 중이거나 실행 중인 줄과, 지금 브랜치가 실패했으면 그것까지. 보여 줄 것이 없으면 undefined.
-export function statusLine(list: Item[], now: number): string | undefined {
-  const parts: string[] = []
+// 입력창 위 CI 요약: 대기 중이거나 실행 중인 줄과, 지금 브랜치가 실패했으면 그것까지. 보여 줄 것이 없으면 undefined.
+export function bandLine(list: Item[], now: number): Seg[] | undefined {
+  const parts: Seg[][] = []
   for (const it of list) {
     const ci = ciOf(it.runs, now)
-    const name = it.pull ? `#${it.num}` : it.branch
-    if (ci.state === 'failure' && (ci.active || it.current)) parts.push(`✗ ${name}`)
-    else if (ci.state === 'running') parts.push(`▶ ${name} ${dur(now - ci.since)}`)
-    else if (ci.state === 'queued') parts.push(`⏳ ${name} 대기 ${dur(now - ci.since)}`)
+    const name: Seg = { t: it.pull ? `#${it.num}` : it.branch }
+    if (ci.state === 'failure' && (ci.active || it.current)) parts.push([{ t: '✗ ', color: 'red' }, name])
+    else if (ci.state === 'running') parts.push([{ t: '▶ ', color: 'cyan' }, name, { t: ` ${dur(now - ci.since)}`, dim: true }])
+    else if (ci.state === 'queued') parts.push([{ t: '⏳ ', color: 'yellow' }, name, { t: ` 대기 ${dur(now - ci.since)}`, dim: true }])
   }
-  return parts.length ? `CI ${parts.join('  ')}` : undefined
+  return parts.length ? [{ t: 'CI ', dim: true }, ...parts.flatMap((p, i) => (i ? [{ t: '  ' }, ...p] : p))] : undefined
 }
 
 // 칸 폭: 한글과 이모지는 두 칸
