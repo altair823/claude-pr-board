@@ -28,6 +28,20 @@ const run = (id: number, o: Record<string, unknown>) => ({
 })
 const job = (name: string, o: Record<string, unknown>) => ({ name, status: 'completed', conclusion: 'success', created_at: at('09:00'), started_at: at('09:00'), completed_at: at('09:01'), ...o })
 
+// gh api graphql 응답. 리뷰어마다 마지막 리뷰와 PR 끝 커밋의 check run이 함께 온다.
+const check = (name: string, o: Record<string, unknown>) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'https://github.com/me/app/actions/runs/30/job/1', ...o })
+const GH_PULLS = {
+  data: { repository: { pullRequests: { nodes: [{
+    number: 12, title: '로그인 화면', headRefName: 'feat/login', headRefOid: SHA.pr, baseRefName: 'main', author: { login: 'altair823' }, isDraft: false,
+    updatedAt: at('09:55'), reviewRequests: { nodes: [{ requestedReviewer: { name: 'Reviewers' } }] },
+    latestReviews: { nodes: [{ author: { login: 'octo' }, state: 'CHANGES_REQUESTED', submittedAt: at('09:40') }] },
+    commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [
+      check('test', { startedAt: at('09:52'), completedAt: at('09:53') }),
+      check('lint', { status: 'IN_PROGRESS', conclusion: null, startedAt: at('09:53'), completedAt: null }),
+    ] } } } }] },
+  }] } } },
+}
+
 const fixture = () => ({
   runs: [
     // PR에서 돈 실행은 브랜치 이름이 비고 PR 번호가 붙는다
@@ -72,11 +86,17 @@ function stubs(on: any, data = fixture(), remote: string | null = 'https://gitea
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (e.argv[0] === 'git' && seen.remote === null) return { value: { exitCode: 128, stdout: '', stderr: 'fatal: not a git repository', isStdoutTruncated: false, isStderrTruncated: false } }
     if (e.argv[0] === 'git') return ok(e.argv[1] === 'remote' ? `${seen.remote}\n` : 'main\n')
-    const path = e.argv[2] ?? ''
+    // gh로 로그인한 GitHub Enterprise 호스트는 없다
+    if (e.argv[0] === 'gh' && e.argv[1] === 'config') return { value: { exitCode: 1, stdout: '', stderr: 'could not find key "user"', isStdoutTruncated: false, isStderrTruncated: false } }
+    // tea api <경로>, gh api --hostname <호스트> <경로 또는 graphql>
+    const path = (e.argv[0] === 'gh' ? e.argv[4] : e.argv[2]) ?? ''
+    if (path === 'graphql') return (seen.api.push(`graphql ${e.argv[6]} ${e.argv[8]}`), ok(JSON.stringify(GH_PULLS)))
     seen.api.push(path)
     if (path.endsWith('/pulls?state=open&limit=50')) return ok(JSON.stringify(PULLS))
     if (path.endsWith('/pulls/12/reviews')) return ok(JSON.stringify(REVIEWS))
-    if (path.endsWith('/actions/runs?limit=50')) return ok(JSON.stringify({ workflow_runs: data.runs, total_count: data.runs.length }))
+    if (path.endsWith('/actions/runs?limit=50') || path.endsWith('/actions/runs?per_page=30&event=push&exclude_pull_requests=true')) {
+      return ok(JSON.stringify({ workflow_runs: data.runs, total_count: data.runs.length }))
+    }
     const m = /\/actions\/runs\/(\d+)\/jobs$/.exec(path)
     if (m) return ok(JSON.stringify({ jobs: data.jobs[Number(m[1])] ?? [], total_count: 0 }))
     return ok('404 page not found')
@@ -230,17 +250,53 @@ test('기다리던 CI가 끝나면 알리고, 실패한 작업을 고쳐 달라�
   await ui.unmount()
 })
 
-test('GitHub 저장소와 API 오류는 안내만 그린다', async ($, on) => {
-  const seen = stubs(on, fixture(), 'git@github.com:me/app.git')
+// GitHub의 실행은 PR에서 돈 것에도 브랜치 이름이 붙고, 시작 시각 이름이 다르고 끝난 시각이 없다.
+const ghFixture = () => {
+  const d = fixture()
+  const runs = (d.runs as Record<string, unknown>[]).map(({ started_at, completed_at, ...r }) => ({
+    ...r, path: '.github/workflows/ci.yml', run_started_at: started_at, updated_at: r.status === 'completed' ? completed_at : at('09:59'),
+    ...(r.event === 'pull_request' && { head_branch: 'feat/login' }),
+  }))
+  return { ...d, runs } as unknown as ReturnType<typeof fixture>
+}
+
+test('GitHub 저장소는 gh로 읽고, PR의 리뷰와 CI는 PR 목록에 함께 온 것을 쓴다', async ($, on) => {
+  const seen = stubs(on, ghFixture(), 'git@github.com:me/app.git')
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await settle()
-  // 보여 줄 수 없는 저장소라 자동으로 열지 않는다. /pr-board로 열면 안내가 보인다.
-  expect(seen.opened).toBe(0)
-  await $.command.run({ command: 'pr-board', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } })
-  await settle()
+  expect(seen.opened).toBe(1)
   const ui = await $.ui.mount(PANE('terminal'))
-  expect((await ui.find({ type: 'Text', text: /GitHub/ }))?.text).toContain('아직 지원하지 않습니다')
+  expect((await ui.find({ key: 'r:pr:12' }))?.text).toMatch(/^ {2}▶ #12 {2}로그인 화면 +lint 7분 +변경 요청$/)
+  expect((await ui.find({ key: 'r:br:feat/queue' }))?.text).toMatch(/^ {2}◌ feat\/queue {2}커밋 29 +대기 12분 *$/)
+  expect((await ui.find({ key: 'r:br:main' }))?.text).toMatch(/^● ✓ main {8}커밋 28 +57분 전 *$/)
+  // GitHub는 새 커밋 뒤에도 리뷰가 남으므로 이전 커밋 표시를 붙이지 않는다
+  expect((await ui.find({ type: 'Text', text: /리뷰 +octo/ }))?.text.trim()).toBe('리뷰    octo 변경 요청  20분 전')
+  expect((await ui.find({ type: 'Text', text: /CI +✓ test/ }))?.text.trim()).toBe('CI      ✓ test  1분    ▶ lint  7분째')
   await ui.unmount()
+  // PR마다 리뷰와 작업 목록을 묻지 않고, 브랜치 줄의 실행만 작업 목록을 읽는다
+  expect(seen.api.filter(p => !p.endsWith('/28/jobs') && !p.endsWith('/29/jobs'))).toEqual([
+    'graphql owner=me name=app',
+    '/repos/me/app/actions/runs?per_page=30&event=push&exclude_pull_requests=true',
+  ])
+})
+
+test('끝나지 않은 실행의 작업 목록은 지금 브랜치와 커서 줄부터 세 개까지만 읽는다', async ($, on) => {
+  const data = fixture()
+  for (const id of [31, 32, 33]) {
+    data.runs.unshift(run(id, { head_branch: `feat/b${id}`, head_sha: String(id).repeat(20), status: 'in_progress', conclusion: null, created_at: at('09:55'), started_at: at('09:56') }))
+  }
+  const seen = stubs(on, data)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await settle()
+  // 끝나지 않은 실행은 30(PR), 33, 32, 31, 29(feat/queue). 목록 순서로 세 개만 읽는다.
+  const live = () => [30, 33, 32, 31, 29].filter(id => seen.api.includes(`/repos/org/app/actions/runs/${id}/jobs`))
+  expect(live()).toEqual([30, 33, 32])
+  // 커서를 feat/queue로 옮기면 그 줄을 먼저 읽는다
+  await $.ui.focus({ component: 'Pane', requestId: 'pr-board', element: 'r:br:feat/queue', origin: { kind: 'person' } })
+  seen.api.length = 0
+  await $.tool.call({ tool: 'Bash', command: 'git push origin feat/queue' })
+  await settle()
+  expect(live()).toEqual([30, 33, 29])
 })
 
 test('git 저장소가 아니면 안내만 그리고, 세션을 시작할 때 패널을 열지 않는다', async ($, on) => {

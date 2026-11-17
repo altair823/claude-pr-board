@@ -1,4 +1,5 @@
-// Gitea API 응답을 목록 줄로 바꾸는 순수 함수 모음. 화면과 갱신은 register.tsx에 있다.
+// Gitea와 GitHub API 응답을 목록 줄로 바꾸는 순수 함수 모음. 화면과 갱신은 register.tsx에 있다.
+// GitHub REST API의 실행과 작업 응답은 Gitea와 같은 모양이라 같은 함수로 읽는다.
 import type { Board, CiState, Job, Pull, Review, Run } from '../types'
 
 export type Seg = { t: string; color?: string; dim?: true; bold?: true; bg?: string }
@@ -74,6 +75,76 @@ export function parsePulls(v: unknown): Pull[] {
   }))
 }
 
+// GitHub의 PR 목록(gh api graphql). 한 번에 리뷰어마다 마지막 리뷰와 PR 끝 커밋의 CI 결과(작업마다 하나인 check run)까지 받아서,
+// PR마다 리뷰나 작업 목록을 따로 묻지 않는다. CI 결과 계산이 가장 무거워서 최근에 바뀐 PR GH_PR_LIMIT개만 읽는다(패널에 보이는 수보다 많다).
+// 충돌 여부(mergeable)는 묻지 않는다. 물으면 GitHub가 PR마다 병합 가능 여부를 다시 계산하는 작업을 시작한다.
+export const GH_PR_LIMIT = 30
+export const GH_PR_QUERY = `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: ${GH_PR_LIMIT}, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes {
+        number title headRefName headRefOid baseRefName isDraft updatedAt author { login }
+        reviewRequests(first: 10) { nodes { requestedReviewer { ... on User { login } ... on Team { name } } } }
+        latestReviews(first: 10) { nodes { author { login } state submittedAt } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 50) { nodes {
+          __typename
+          ... on CheckRun { name status conclusion startedAt completedAt detailsUrl }
+          ... on StatusContext { context state createdAt }
+        } } } } } }
+      }
+    }
+  }
+}`
+
+// GitHub는 새 커밋을 올려도 승인과 변경 요청이 그대로 남으므로(저장소에서 따로 설정하지 않으면) 지난 리뷰로 보지 않는다.
+const GH_REVIEW: Record<string, string> = { APPROVED: 'APPROVED', CHANGES_REQUESTED: 'REQUEST_CHANGES', COMMENTED: 'COMMENT' }
+// 외부 CI가 남긴 커밋 상태(StatusContext)
+const GH_STATUS: Record<string, CiState> = { SUCCESS: 'success', FAILURE: 'failure', ERROR: 'failure', PENDING: 'running', EXPECTED: 'blocked' }
+
+export function parseGhPulls(v: unknown): Pull[] {
+  return list((v as J | null)?.data?.repository?.pullRequests, 'nodes').map(p => ({
+    num: Number(p.number) || 0,
+    title: String(p.title ?? ''),
+    branch: String(p.headRefName ?? ''),
+    base: String(p.baseRefName ?? ''),
+    sha: String(p.headRefOid ?? ''),
+    author: String(p.author?.login ?? ''),
+    draft: !!p.isDraft,
+    mergeable: true,
+    updated: ms(p.updatedAt),
+    // 팀에 요청한 리뷰는 login 대신 팀 이름이 온다
+    requested: list(p.reviewRequests, 'nodes').map(r => String(r.requestedReviewer?.login ?? r.requestedReviewer?.name ?? '')),
+    reviews: list(p.latestReviews, 'nodes')
+      .filter(r => GH_REVIEW[r.state])
+      .map(r => ({ user: String(r.author?.login ?? ''), state: GH_REVIEW[r.state]!, stale: false, t: ms(r.submittedAt) })),
+    runs: checkRuns(list(list(p.commits, 'nodes')[0]?.commit?.statusCheckRollup?.contexts, 'nodes'), String(p.headRefOid ?? '')),
+  }))
+}
+
+// check run을 워크플로 실행마다 묶는다. 실행 번호는 detailsUrl(.../actions/runs/<번호>/job/<번호>)에 있고, 커밋 상태는 0번으로 묶는다.
+// check run에는 만들어진 시각이 없어 시작 시각을 쓴다. 대기 중이라 시작 시각이 없으면 기다린 시간을 쓰지 않는다.
+function checkRuns(nodes: J[], sha: string): Run[] {
+  const runs = new Map<number, Run>()
+  for (const c of nodes) {
+    const id = Number(/\/actions\/runs\/(\d+)/.exec(String(c.detailsUrl ?? ''))?.[1]) || 0
+    const job: Job =
+      c.__typename === 'StatusContext'
+        ? { name: String(c.context ?? ''), state: GH_STATUS[c.state] ?? 'none', created: ms(c.createdAt), started: ms(c.createdAt), done: 0 }
+        : {
+            name: String(c.name ?? ''),
+            state: stateOf(String(c.status ?? '').toLowerCase(), String(c.conclusion ?? '').toLowerCase()),
+            created: ms(c.startedAt),
+            started: ms(c.startedAt),
+            done: ms(c.completedAt),
+          }
+    const run = runs.get(id) ?? { id, title: '', workflow: '', event: 'pull_request', branch: '', sha, pr: 0, state: 'none', created: 0, started: 0, done: 0, jobs: [] }
+    run.jobs!.push(job)
+    run.state = run.jobs!.some(j => isLive(j.state)) ? 'running' : run.jobs!.some(j => j.state === 'failure') ? 'failure' : 'success'
+    runs.set(id, run)
+  }
+  return [...runs.values()]
+}
+
 // 리뷰 요청 기록(REQUEST_REVIEW)과 작성 중인 리뷰(PENDING)는 뺀다.
 export function parseReviews(v: unknown): Review[] {
   return list(v)
@@ -85,16 +156,17 @@ export function parseRuns(v: unknown): Run[] {
   return list(v, 'workflow_runs').map(r => ({
     id: Number(r.id) || 0,
     title: String(r.display_title ?? ''),
-    // path는 'ci.yml@refs/heads/main' 꼴이다.
-    workflow: String(r.path ?? '').split('@')[0] ?? '',
+    // path는 Gitea가 'ci.yml@refs/heads/main', GitHub가 '.github/workflows/ci.yml' 꼴이다.
+    workflow: String(r.path ?? '').split('@')[0]!.split('/').pop() ?? '',
     event: String(r.event ?? ''),
     branch: String(r.head_branch ?? ''),
     sha: String(r.head_sha ?? ''),
     pr: Number(list(r.pull_requests)[0]?.number) || 0,
     state: stateOf(r.status, r.conclusion),
     created: ms(r.created_at),
-    started: ms(r.started_at),
-    done: ms(r.completed_at),
+    // GitHub의 실행에는 시작 시각 이름이 다르고 끝난 시각이 없다. 끝난 실행은 마지막으로 바뀐 시각을 쓴다.
+    started: ms(r.started_at ?? r.run_started_at),
+    done: ms(r.completed_at) || (r.status === 'completed' ? ms(r.updated_at) : 0),
   }))
 }
 
@@ -129,7 +201,8 @@ export function items(b: Board, now: number): Item[] {
     num: p.num,
     branch: p.branch,
     title: p.title,
-    runs: latest(runs.filter(r => r.sha === p.sha)),
+    // GitHub는 PR 목록에 함께 온 CI 결과를 쓴다
+    runs: p.runs ?? latest(runs.filter(r => r.sha === p.sha)),
     pull: p,
     current: p.branch === b.branch,
   }))
@@ -181,7 +254,16 @@ export function waitFrom(job: Job, runs: Run[]): number {
   return Math.max(job.created, before)
 }
 
-const names = (jobs: Job[]) => (jobs.length > 1 ? `${jobs[0]!.name} 외 ${jobs.length - 1}개` : (jobs[0]?.name ?? ''))
+// 시작 시각을 모르는 대기(GitHub의 대기 중인 check run)는 기다린 시간을 쓰지 않는다
+const waited = (t: number, now: number) => (t ? `대기 ${dur(now - t)}` : '대기')
+
+// 목록 줄의 작업 이름. GitHub의 matrix 작업처럼 긴 이름이 제목을 밀어내지 않게 자른다.
+const clip = (s: string, n: number) => (width(s) <= n ? s : fit([{ t: s }], [], n)[0]!.t)
+const names = (jobs: Job[]) => (jobs.length > 1 ? `${clip(jobs[0]!.name, 14)} 외 ${jobs.length - 1}개` : clip(jobs[0]?.name ?? '', 14))
+
+// 상세에서 작업이 한 줄에 다 들어가지 않을 때 먼저 쓰는 순서
+const RANK: CiState[] = ['failure', 'running', 'queued', 'blocked', 'cancelled', 'success', 'skipped', 'none']
+export const ranked = (jobs: Job[]) => [...jobs].sort((x, y) => RANK.indexOf(x.state) - RANK.indexOf(y.state))
 
 export function ciOf(runs: Run[], now: number): Ci {
   if (!runs.length) return { state: 'none', active: false, mark: { t: '-', dim: true }, note: { t: 'CI 없음', dim: true }, since: 0 }
@@ -196,7 +278,7 @@ export function ciOf(runs: Run[], now: number): Ci {
   }
   if (queued.length) {
     const since = Math.min(...queued.map(j => waitFrom(j, runs)))
-    return { state: 'queued', active, mark: { t: '◌', color: 'yellow' }, note: { t: `대기 ${dur(now - since)}`, color: 'yellow' }, since }
+    return { state: 'queued', active, mark: { t: '◌', color: 'yellow' }, note: { t: waited(since, now), color: 'yellow' }, since }
   }
   // 앞 작업이 막 끝나 다음 작업이 아직 대기열에 들어가지 않은 짧은 순간
   if (active) return { state: 'queued', active, mark: { t: '◌', dim: true }, note: { t: '다음 작업 준비', dim: true }, since: now }
@@ -207,7 +289,7 @@ export function ciOf(runs: Run[], now: number): Ci {
 
 // 상세의 작업 하나. 앞 작업을 기다리는 작업은 러너 대기와 구분해 무엇 뒤에 도는지 보여 준다.
 export function jobLine(j: Job, runs: Run[], now: number): Seg[] {
-  if (j.state === 'queued') return [{ t: '◌ ', color: 'yellow' }, { t: j.name }, { t: `  대기 ${dur(now - waitFrom(j, runs))}`, dim: true }]
+  if (j.state === 'queued') return [{ t: '◌ ', color: 'yellow' }, { t: j.name }, { t: `  ${waited(waitFrom(j, runs), now)}`, dim: true }]
   if (j.state === 'running') return [{ t: '▶ ', color: 'cyan' }, { t: j.name }, { t: `  ${dur(now - (j.started || now))}째`, dim: true }]
   if (j.state === 'blocked') {
     const ahead = (runs.find(r => r.jobs?.includes(j))?.jobs ?? []).filter(x => x.state === 'running' || x.state === 'queued')

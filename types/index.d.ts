@@ -24,7 +24,7 @@ export type Run = {
 
 export type Review = { user: string; state: string; stale: boolean; t: number }
 
-// requested: 리뷰를 요청받은 사람
+// requested: 리뷰를 요청받은 사람, runs: GitHub에서 PR 목록과 함께 받은 PR 끝 커밋의 CI(Gitea는 없고 실행 목록에서 찾는다)
 export type Pull = {
   num: number
   title: string
@@ -37,10 +37,12 @@ export type Pull = {
   updated: number
   requested: string[]
   reviews: Review[]
+  runs?: Run[]
 }
 
-// repo: owner/repo, branch: 지금 체크아웃한 로컬 브랜치, fetched: 마지막으로 읽은 시각(ms)
-export type Board = { host: string; repo: string; branch: string; pulls: Pull[]; runs: Run[]; fetched: number; error?: string }
+// repo: owner/repo, branch: 지금 체크아웃한 로컬 브랜치, fetched: 마지막으로 읽은 시각(ms),
+// github: GitHub나 GitHub Enterprise 저장소(gh로 읽는다). 없으면 Gitea 저장소(tea로 읽는다)
+export type Board = { host: string; repo: string; branch: string; pulls: Pull[]; runs: Run[]; fetched: number; github?: true; error?: string }
 
 // cur: 커서가 있는 줄의 key
 export type View = { cur: string }

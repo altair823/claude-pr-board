@@ -2,10 +2,12 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Board, Job, PaneState, Review, View } from '../types'
-import { bandLine, ciOf, dur, fit, isLive, items, jobLine, jobsOf, nameWidth, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, reviewOf, rowLeft, rowRight, section, width } from './board'
+import { GH_PR_LIMIT, GH_PR_QUERY, bandLine, ciOf, dur, fit, isLive, items, jobLine, jobsOf, nameWidth, parseGhPulls, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, ranked, reviewOf, rowLeft, rowRight, section, width } from './board'
 import type { Item, Seg } from './board'
 
 const PANE = 'pr-board'
+// Gitea에서 한 번에 읽는 열린 PR 수
+const PR_LIMIT = 50
 // 상세 구역의 최대 줄 수(머리 줄 포함)
 const DETAIL_ROWS = 7
 // 커서가 있는 줄의 배경. 밝은 테마와 어두운 테마 모두에서 보이도록 테마 색을 쓴다.
@@ -19,20 +21,35 @@ const pane = atom({ plugin: 'pr-board', key: 'pane' } as const, 'closed' as Pane
 // 사람이 /pr-board로 연 뒤 직접 닫지 않았으면 다음 세션에도 연다($.store에 남긴다).
 const OPENED = 'opened'
 // 인증이 없을 때 입력을 기다리며 멈추지 않게 한다.
-const QUIET = { GIT_TERMINAL_PROMPT: '0' }
-// 이 명령 뒤에는 원격 상태가 바뀌었을 수 있어 바로 다시 읽는다.
-const REMOTE_CMD = /\bgit\s+push\b|\bgitea-|\btea\s/
+const QUIET = { GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' }
+// 이 명령 뒤에는 원격 상태가 바뀌었을 수 있어 바로 다시 읽는다. gh는 조회 명령이 잦아 PR과 CI를 바꾸는 명령만 본다.
+const REMOTE_CMD = /\bgit\s+push\b|\bgitea-|\btea\s|\bgh\s+(?:pr|run|workflow)\s+(?:create|merge|close|reopen|ready|review|rerun|cancel|run)\b/
 
 // 끝난 실행의 작업 목록은 바뀌지 않아 기억한다. 리뷰는 PR의 갱신 시각이 그대로면 다시 읽지 않는다.
 // ponytail: 모듈을 다시 불러오면 비워져 한 번 다시 읽는다. 500개를 넘으면 통째로 비운다.
 const jobMemo = new Map<number, Job[]>()
 const reviewMemo = new Map<string, Review[]>()
 
-async function api($: EngineInterface, path: string): Promise<unknown> {
-  const out = await $.process.run(['tea', 'api', path], { env: QUIET, timeoutMs: 20_000 }).catch(() => undefined)
-  if (!out) throw new Error('tea CLI를 실행하지 못했습니다. tea를 설치하고 tea login add로 Gitea에 로그인해 주세요')
-  if (out.exitCode !== 0) throw new Error((out.stderr || out.stdout).trim().split('\n').pop() || `tea 종료 코드 ${out.exitCode}`)
+// tea나 gh로 JSON을 읽는다. 둘 다 저장해 둔 로그인으로 인증하므로 mod는 토큰을 다루지 않는다.
+async function cli($: EngineInterface, argv: string[]): Promise<unknown> {
+  const out = await $.process.run(argv, { env: QUIET, timeoutMs: 20_000 }).catch(() => undefined)
+  if (!out) {
+    throw new Error(argv[0] === 'gh' ? 'gh CLI를 실행하지 못했습니다. gh를 설치하고 gh auth login으로 로그인해 주세요' : 'tea CLI를 실행하지 못했습니다. tea를 설치하고 tea login add로 Gitea에 로그인해 주세요')
+  }
+  if (out.exitCode !== 0) throw new Error((out.stderr || out.stdout).trim().split('\n').pop() || `${argv[0]} 종료 코드 ${out.exitCode}`)
   return parseJson(out.stdout)
+}
+const api = ($: EngineInterface, b: Board, path: string) => cli($, b.github ? ['gh', 'api', '--hostname', b.host, path] : ['tea', 'api', path])
+
+// github.com과 gh로 로그인해 둔 호스트(GitHub Enterprise)는 GitHub로, 나머지는 Gitea로 본다. gh의 로컬 설정만 보고 원격에 묻지 않는다.
+const ghHosts = new Map<string, boolean>()
+async function isGitHub($: EngineInterface, host: string): Promise<boolean> {
+  if (host === 'github.com') return true
+  if (!ghHosts.has(host)) {
+    const out = await $.process.run(['gh', 'config', 'get', 'user', '-h', host], { env: QUIET }).catch(() => undefined)
+    ghHosts.set(host, out?.exitCode === 0)
+  }
+  return ghHosts.get(host)!
 }
 
 // git만 확인한다(네트워크를 쓰지 않는다). 오류가 없으면 PR과 CI를 읽을 수 있는 저장소다.
@@ -43,12 +60,10 @@ async function locate($: EngineInterface): Promise<Board> {
   if (!head) return { ...EMPTY, error: 'git을 실행하지 못했습니다' }
   if (head.exitCode !== 0) return { ...EMPTY, error: 'git 저장소가 아닙니다' }
   const branch = head.stdout.trim()
-  if (remote?.exitCode !== 0) return { ...EMPTY, branch, error: 'origin 원격이 없습니다. origin이 Gitea 저장소를 가리키면 PR과 CI를 보여 줍니다' }
+  if (remote?.exitCode !== 0) return { ...EMPTY, branch, error: 'origin 원격이 없습니다. origin이 GitHub나 Gitea 저장소를 가리키면 PR과 CI를 보여 줍니다' }
   const where = parseRemote(remote.stdout)
   if (!where) return { ...EMPTY, branch, error: `원격 주소를 읽지 못했습니다: ${remote.stdout.trim()}` }
-  const base: Board = { ...EMPTY, ...where, branch }
-  if (where.host === 'github.com') return { ...base, error: 'GitHub 저장소는 아직 지원하지 않습니다. 지금은 Gitea 저장소만 보여 줍니다' }
-  return base
+  return { ...EMPTY, ...where, branch, ...((await isGitHub($, where.host)) && { github: true as const }) }
 }
 
 // 같은 저장소를 보는 세션들이 조회 결과를 나눠 쓰는 파일. 세션이 몇 개든 저장소마다 한 세션분만 조회한다.
@@ -62,7 +77,7 @@ const mtimeOf = ($: EngineInterface, file: string) => $.fs.stat(file).then(st =>
 let seenMtime = 0
 
 // 대기나 실행 중인 CI가 있으면 짧게, 없으면 길게 기다린다.
-const dueIn = (b: Board, now: number) => (!b.error && items(b, now).some(it => ciOf(it.runs, now).active) ? ACTIVE_MS : IDLE_MS)
+const dueIn = (b: Board, now: number) => (!b.error && items(b, now).some(it => ciOf(it.runs, now).active) ? (b.github ? GH_ACTIVE_MS : ACTIVE_MS) : IDLE_MS)
 
 async function readShared($: EngineInterface, file: string, base: Board): Promise<Board | undefined> {
   const mtime = await mtimeOf($, file)
@@ -85,39 +100,54 @@ async function load($: EngineInterface, force = false): Promise<Board> {
     if (shared && now - shared.fetched < dueIn(shared, now) - 100) return shared
   }
   const R = `/repos/${base.repo}`
+  const [owner, name] = [base.repo.slice(0, base.repo.indexOf('/')), base.repo.slice(base.repo.indexOf('/') + 1)]
   try {
     const [pulls, runs] = await Promise.all([
-      api($, `${R}/pulls?state=open&limit=50`).then(parsePulls),
+      base.github
+        ? cli($, ['gh', 'api', '--hostname', base.host, 'graphql', '-f', `owner=${owner}`, '-f', `name=${name}`, '-f', `query=${GH_PR_QUERY}`]).then(parseGhPulls)
+        : api($, base, `${R}/pulls?state=open&limit=${PR_LIMIT}`).then(parsePulls),
       // Actions를 쓰지 않는 저장소는 실행 목록이 오류다. PR은 그대로 보여 준다.
-      api($, `${R}/actions/runs?limit=50`).then(parseRuns, () => []),
+      // GitHub는 PR의 CI를 PR 목록과 함께 받으므로 브랜치 줄에 쓸 push 실행만 읽는다. 예약 실행이 잦은 저장소에서
+      // 목록이 예약 실행으로 차지 않게 하려는 것이다. 실행마다 저장소 정보가 붙어 커서(30개에 약 340KB) 쓰지 않는 PR 번호 목록은 뺀다.
+      api($, base, base.github ? `${R}/actions/runs?per_page=30&event=push&exclude_pull_requests=true` : `${R}/actions/runs?limit=50`).then(parseRuns, () => []),
     ])
     if (reviewMemo.size > 500) reviewMemo.clear()
     if (jobMemo.size > 500) jobMemo.clear()
-    await Promise.all(
-      pulls.map(async p => {
-        const k = `${p.num}@${p.updated}`
-        const hit = reviewMemo.get(k)
-        if (hit) return void (p.reviews = hit)
-        const got = await api($, `${R}/pulls/${p.num}/reviews`).then(parseReviews, () => undefined)
-        if (got) reviewMemo.set(k, (p.reviews = got))
-      }),
-    )
+    // GitHub는 PR 목록에 리뷰가 함께 온다.
+    if (!base.github) {
+      await Promise.all(
+        pulls.map(async p => {
+          const k = `${p.num}@${p.updated}`
+          const hit = reviewMemo.get(k)
+          if (hit) return void (p.reviews = hit)
+          const got = await api($, base, `${R}/pulls/${p.num}/reviews`).then(parseReviews, () => undefined)
+          if (got) reviewMemo.set(k, (p.reviews = got))
+        }),
+      )
+    }
     const now = await $.clock.now()
     const next: Board = { ...base, pulls, runs, fetched: now }
     // 목록에 나오는 실행의 작업만 읽는다. 다시 실행하면 같은 실행 번호로 다시 돌므로, 기억한 작업은 끝난 실행에만 쓴다.
-    const shown = new Set(items(next, now).flatMap(it => it.runs.map(r => r.id)))
+    // 끝나지 않은 실행은 매번 다시 읽어야 해서, 지금 브랜치와 커서가 있는 줄부터 LIVE_JOBS개 실행만 읽는다.
+    // 나머지 줄은 실행 하나를 작업 하나로 보고 그린다.
+    const cur = (await read($, view)).cur
+    const list = items(next, now)
+    const first = (it: Item) => it.current || it.key === cur
+    const order = [...new Set([...list.filter(first), ...list.filter(it => !first(it))].flatMap(it => it.runs))]
+    let live = 0
     await Promise.all(
-      runs
-        .filter(r => shown.has(r.id))
-        .map(async r => {
-          const done = !isLive(r.state)
-          const hit = done ? jobMemo.get(r.id) : undefined
-          if (hit) return void (r.jobs = hit)
-          const jobs = await api($, `${R}/actions/runs/${r.id}/jobs`).then(parseJobs, () => undefined)
-          if (!jobs) return
-          r.jobs = jobs
-          if (done) jobMemo.set(r.id, jobs)
-        }),
+      order.map(async r => {
+        // GitHub의 PR 줄은 작업까지 이미 받았다
+        if (r.jobs) return
+        const done = !isLive(r.state)
+        if (!done && live++ >= LIVE_JOBS) return
+        const hit = done ? jobMemo.get(r.id) : undefined
+        if (hit) return void (r.jobs = hit)
+        const jobs = await api($, base, `${R}/actions/runs/${r.id}/jobs`).then(parseJobs, () => undefined)
+        if (!jobs) return
+        r.jobs = jobs
+        if (done) jobMemo.set(r.id, jobs)
+      }),
     )
     if (file) {
       await $.fs.write(file, JSON.stringify({ ...next, branch: '' })).catch(() => {})
@@ -187,9 +217,13 @@ async function refresh($: EngineInterface, force = false) {
 const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id === PANE)
 
 // 원격 서버 부하를 줄이려고 패널을 연 세션에서만 읽는다(다른 탭에 가려져 있어도 연 것이다).
-// 대기나 실행 중인 CI가 있으면 15초, 없으면 5분마다 읽고, push 같은 명령 뒤에는 바로 읽는다.
+// 대기나 실행 중인 CI가 있으면 15초(GitHub는 30초), 없으면 5분마다 읽고, push 같은 명령 뒤에는 바로 읽는다.
+// GitHub는 사용자마다 시간당 요청 수 한도가 있고 회사 GitHub Enterprise는 부하에 민감할 수 있어 더 길게 둔다.
 const ACTIVE_MS = 15_000
+const GH_ACTIVE_MS = 30_000
 const IDLE_MS = 300_000
+// 한 번 읽을 때 작업 목록을 다시 읽는 끝나지 않은 실행의 최대 수
+const LIVE_JOBS = 3
 
 // 타이머는 2초마다 깨어나 패널 상태, 디렉터리, 공유 파일이 바뀌었는지만 본다(원격을 읽지 않는다).
 async function tick($: EngineInterface) {
@@ -226,7 +260,7 @@ export function sayFor(it: Item, kind: Kind): string | undefined {
   if (kind === 'review') return pr && `${pr}의 리뷰 코멘트를 확인하고 반영해 줘`
   if (kind === 'merge') return pr && `${pr}를 머지해 줘`
   const run = it.runs.find(r => jobsOf([r]).some(j => j.state === 'failure'))
-  return run && `${pr ? `${pr}(${it.branch})` : `${it.branch} 브랜치`}의 CI 실패 원인을 로그에서 찾아 고쳐 줘(실행 #${run.id})`
+  return run && `${pr ? `${pr}(${it.branch})` : `${it.branch} 브랜치`}의 CI 실패 원인을 로그에서 찾아 고쳐 줘${run.id ? `(실행 #${run.id})` : ''}`
 }
 
 async function ask($: EngineInterface, kind: Kind) {
@@ -266,12 +300,13 @@ export function detailLines(it: Item | undefined, now: number, cols: number): Se
     out.push(field('커밋', [{ t: run ? `${run.sha.slice(0, 7)}  ` : '', dim: true }, { t: it.title }]))
     if (run) out.push(field('실행', [{ t: `#${run.id}`, dim: true }]))
   }
-  const jobs = jobsOf(it.runs).map(j => jobLine(j, it.runs, now))
+  const all = jobsOf(it.runs)
   const done = (rows: Seg[][]) => rows.slice(0, DETAIL_ROWS).map(l => fit(l, [], cols))
-  if (!jobs.length) return done([...out, field('CI', [{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])])
-  // 한 줄에 들어가면 작업을 나란히, 아니면 한 줄에 하나씩 쓴다.
-  const inline = jobs.flatMap((j, i) => (i ? [{ t: '    ' }, ...j] : j))
+  if (!all.length) return done([...out, field('CI', [{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])])
+  // 한 줄에 들어가면 작업을 워크플로 순서대로 나란히, 아니면 실패, 실행, 대기 중인 작업부터 한 줄에 하나씩 쓴다.
+  const inline = all.map(j => jobLine(j, it.runs, now)).flatMap((j, i) => (i ? [{ t: '    ' }, ...j] : j))
   if (width(inline.map(s => s.t).join('')) <= cols - LABEL - 2) return done([...out, field('CI', inline)])
+  const jobs = ranked(all).map(j => jobLine(j, it.runs, now))
   const room = DETAIL_ROWS - out.length
   const fits = jobs.length > room ? jobs.slice(0, Math.max(0, room - 1)) : jobs
   fits.forEach((j, i) => out.push(field(i ? '' : 'CI', j)))
@@ -368,7 +403,8 @@ export const register: Register = on => {
     // 열린 PR 구역과 브랜치 구역. 구역 머리와 사이의 빈 줄도 목록 줄로 센다.
     type Row = { item: Item } | { segs: Seg[] }
     const rows: Row[] = [
-      ...(prs.length ? [{ segs: section(`열린 PR ${prs.length}`, cols) }, ...prs.map(item => ({ item }))] : []),
+      // 한 번에 읽는 PR 수를 채웠으면 더 있을 수 있어 +를 붙인다
+      ...(prs.length ? [{ segs: section(`열린 PR ${prs.length}${prs.length >= (b.github ? GH_PR_LIMIT : PR_LIMIT) ? '+' : ''}`, cols) }, ...prs.map(item => ({ item }))] : []),
       ...(prs.length && brs.length ? [{ segs: [] }] : []),
       ...(brs.length ? [{ segs: section(`브랜치 ${brs.length}`, cols) }, ...brs.map(item => ({ item }))] : []),
     ]
