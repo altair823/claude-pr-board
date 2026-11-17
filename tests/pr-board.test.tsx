@@ -137,12 +137,13 @@ test('앞 작업이 끝나야 시작하는 작업은 그 뒤부터 기다린 시
   expect(ciText([r!])).toBe('◌ 대기 16분')
 })
 
-test('앞 작업을 기다리는 작업(Gitea 28의 pending)은 러너 대기와 구분한다', () => {
+test('앞 작업을 기다리는 작업(Gitea 28.1의 requested)은 러너 대기와 구분한다', () => {
   const [r] = parseRuns({ workflow_runs: [run(1, { status: 'in_progress', conclusion: null, created_at: at('09:50'), started_at: at('09:51') })] })
   r!.jobs = parseJobs({
     jobs: [
       job('test', { status: 'in_progress', conclusion: null, created_at: at('09:50'), started_at: at('09:51'), completed_at: null }),
-      job('release', { status: 'pending', conclusion: null, created_at: at('09:50'), started_at: null, completed_at: null }),
+      // 실제 Gitea 28.1 응답: needs로 test를 기다리는 작업
+      job('release', { status: 'requested', conclusion: null, created_at: at('09:50'), started_at: '1970-01-01T00:00:00Z', completed_at: '1970-01-01T00:00:00Z' }),
     ],
   })
   expect(ciText([r!])).toBe('▶ test 9분')

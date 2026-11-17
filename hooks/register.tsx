@@ -267,15 +267,16 @@ export function detailLines(it: Item | undefined, now: number, cols: number): Se
     if (run) out.push(field('실행', [{ t: `#${run.id}`, dim: true }]))
   }
   const jobs = jobsOf(it.runs).map(j => jobLine(j, it.runs, now))
-  if (!jobs.length) return [...out, field('CI', [{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])].slice(0, DETAIL_ROWS)
+  const done = (rows: Seg[][]) => rows.slice(0, DETAIL_ROWS).map(l => fit(l, [], cols))
+  if (!jobs.length) return done([...out, field('CI', [{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])])
   // 한 줄에 들어가면 작업을 나란히, 아니면 한 줄에 하나씩 쓴다.
   const inline = jobs.flatMap((j, i) => (i ? [{ t: '    ' }, ...j] : j))
-  if (width(inline.map(s => s.t).join('')) <= cols - LABEL - 2) return [...out, field('CI', inline)].slice(0, DETAIL_ROWS)
+  if (width(inline.map(s => s.t).join('')) <= cols - LABEL - 2) return done([...out, field('CI', inline)])
   const room = DETAIL_ROWS - out.length
   const fits = jobs.length > room ? jobs.slice(0, Math.max(0, room - 1)) : jobs
-  fits.forEach((j, i) => out.push(fit(field(i ? '' : 'CI', j), [], cols)))
+  fits.forEach((j, i) => out.push(field(i ? '' : 'CI', j)))
   if (fits.length < jobs.length) out.push(field('', [{ t: `작업 ${jobs.length - fits.length}개 더`, dim: true }]))
-  return out.slice(0, DETAIL_ROWS)
+  return done(out)
 }
 
 export const register: Register = on => {

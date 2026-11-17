@@ -32,8 +32,8 @@ export function stateOf(status: unknown, conclusion?: unknown): CiState {
   }
   if (status === 'in_progress' || status === 'running') return 'running'
   if (status === 'queued') return 'queued'
-  // 앞 작업(needs)이 끝나기를 기다리는 작업. Gitea 28은 pending, 1.26까지는 waiting으로 준다.
-  return status === 'pending' || status === 'waiting' || status === 'blocked' ? 'blocked' : 'none'
+  // 앞 작업(needs)이 끝나기를 기다리는 작업. Gitea 28.1은 requested(소스상 pending도 있다), 1.26까지는 waiting으로 준다.
+  return status === 'requested' || status === 'pending' || status === 'waiting' || status === 'blocked' ? 'blocked' : 'none'
 }
 
 export const isLive = (s: CiState) => s === 'queued' || s === 'running' || s === 'blocked'
