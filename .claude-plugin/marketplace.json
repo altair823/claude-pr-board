@@ -10,7 +10,7 @@
       "description": "Claude Code 패널에 열린 PR과 브랜치별 CI 상태를 보여 준다(release 브랜치, CI가 시험을 통과한 커밋만 릴리스한다)",
       "source": {
         "source": "url",
-        "url": "https://gitea.altair823.xyz/altair823-org/claude-pr-board.git",
+        "url": "https://github.com/altair823/claude-pr-board.git",
         "ref": "release"
       }
     }

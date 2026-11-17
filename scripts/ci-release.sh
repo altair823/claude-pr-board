@@ -31,7 +31,7 @@ fi
 # 지난 태그와 main이 갈라진 곳(merge-base)부터 센다.
 base="${last:+$(git merge-base "v$last" HEAD)}"
 notes="$(git log --no-merges --format='- %s' ${base:+"$base"..}HEAD)"
-body="$(printf '%s\n\n## 변경\n\n%s\n\n## 설치\n\n```\nclaude plugin marketplace add https://gitea.altair823.xyz/altair823-org/claude-pr-board.git\nclaude plugin install pr-board@claude-pr-board\n```\n\n이미 설치했다면 claude plugin update pr-board@claude-pr-board로 받고 /reload-plugins로 적용한다.\n' \
+body="$(printf '%s\n\n## 변경\n\n%s\n\n## 설치\n\n```\nclaude plugin marketplace add altair823/claude-pr-board\nclaude plugin install pr-board@claude-pr-board\n```\n\n이미 설치했다면 claude plugin update pr-board@claude-pr-board로 받고 /reload-plugins로 적용한다.\n' \
     "pr-board $next 릴리스다. main의 시험을 통과한 커밋을 CI가 릴리스했다." "$notes")"
 
 if [ "${DRY_RUN:-}" = 1 ]; then

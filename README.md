@@ -7,7 +7,7 @@ Claude Code 패널에 현재 저장소의 열린 PR과 브랜치별 CI 상태를
 ## 설치
 
 ```
-claude plugin marketplace add https://gitea.altair823.xyz/altair823-org/claude-pr-board.git
+claude plugin marketplace add altair823/claude-pr-board
 claude plugin install pr-board@claude-pr-board
 ```
 
@@ -61,6 +61,12 @@ Gitea 서버에 주는 부하를 줄이려고 다음처럼 조회합니다.
 - 같은 저장소를 연 세션이 여러 개면 조회 결과를 `~/.cache/claude-pr-board/<호스트>/<저장소>.json`에 두고 함께 씁니다. 다른 세션이 읽은 결과가 아직 새것이면 서버에 묻지 않고 그 파일을 읽습니다. 그래서 세션이 몇 개든 저장소마다 한 세션분만 조회합니다. push 뒤나 `r`을 누를 때는 파일과 상관없이 서버에서 읽습니다.
 
 두 세션의 조회 시각이 같은 순간에 돌아오면 드물게 둘 다 조회할 수 있습니다.
+
+## 이슈와 PR
+
+버그나 제안은 이슈로 올리면 됩니다.
+
+이 저장소는 비공개 저장소를 그대로 옮겨 오는 미러라서, 여기서 PR을 머지하면 다음 동기화 때 지워집니다. 그래서 PR 내용은 비공개 저장소에 옮겨 반영하고, PR 작성자를 커밋의 공동 작성자로 남긴 뒤 PR을 닫습니다.
 
 ## 개발
 
