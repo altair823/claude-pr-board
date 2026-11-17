@@ -2,11 +2,14 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { Board, Job, PaneState, Review, View } from '../types'
-import { bandLine, ciOf, dur, fit, items, jobLine, jobsOf, labelOf, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, reviewOf } from './board'
+import { bandLine, ciOf, dur, fit, isLive, items, jobLine, jobsOf, nameWidth, parseJobs, parseJson, parsePulls, parseRemote, parseReviews, parseRuns, reviewOf, rowLeft, rowRight, section, width } from './board'
 import type { Item, Seg } from './board'
 
 const PANE = 'pr-board'
+// 상세 구역의 최대 줄 수(머리 줄 포함)
 const DETAIL_ROWS = 7
+// 커서가 있는 줄의 배경. 밝은 테마와 어두운 테마 모두에서 보이도록 테마 색을 쓴다.
+const SEL_BG = 'subtle'
 const EMPTY: Board = { host: '', repo: '', branch: '', pulls: [], runs: [], fetched: 0 }
 // 저장 형태가 바뀌면 shape 값을 올린다. 이전 버전이 저장한 값은 버려진다.
 const board = atom({ plugin: 'pr-board', key: 'board' } as const, EMPTY, { shape: 'board-1' })
@@ -107,7 +110,7 @@ async function load($: EngineInterface, force = false): Promise<Board> {
       runs
         .filter(r => shown.has(r.id))
         .map(async r => {
-          const done = r.state !== 'queued' && r.state !== 'running'
+          const done = !isLive(r.state)
           const hit = done ? jobMemo.get(r.id) : undefined
           if (hit) return void (r.jobs = hit)
           const jobs = await api($, `${R}/actions/runs/${r.id}/jobs`).then(parseJobs, () => undefined)
@@ -185,7 +188,6 @@ const isOpen = async ($: EngineInterface) => (await $.ui.panes()).some(p => p.id
 
 // 원격 서버 부하를 줄이려고 패널을 연 세션에서만 읽는다(다른 탭에 가려져 있어도 연 것이다).
 // 대기나 실행 중인 CI가 있으면 15초, 없으면 5분마다 읽고, push 같은 명령 뒤에는 바로 읽는다.
-// ponytail: 같은 저장소를 연 세션이 여럿이면 각자 읽는다. 부하가 문제가 되면 $.store로 결과를 나눠 쓴다.
 const ACTIVE_MS = 15_000
 const IDLE_MS = 300_000
 
@@ -236,34 +238,43 @@ async function ask($: EngineInterface, kind: Kind) {
 }
 
 const REVIEW_KO: Record<string, string> = { APPROVED: '승인', REQUEST_CHANGES: '변경 요청', COMMENT: '코멘트' }
+const REVIEW_COLOR: Record<string, string> = { APPROVED: 'green', REQUEST_CHANGES: 'red' }
+
+// 상세의 한 줄: 흐린 항목 이름 열과 값
+const LABEL = 8
+const field = (label: string, value: Seg[]): Seg[] => [{ t: `  ${label}${' '.repeat(LABEL - width(label))}`, dim: true }, ...value]
 
 export function detailLines(it: Item | undefined, now: number, cols: number): Seg[][] {
   if (!it) return [[{ t: '줄을 고르면 PR과 CI의 상세가 여기에 나옵니다', dim: true }]]
-  const out: Seg[][] = []
   const p = it.pull
+  const run = it.runs[0]
+  const out: Seg[][] = [section(p ? `#${p.num}` : it.branch, cols)]
   if (p) {
     const flags: Seg[] = [...(p.draft ? [{ t: '  draft', dim: true as const }] : []), ...(p.mergeable ? [] : [{ t: '  충돌', color: 'red' }])]
-    out.push(fit([{ t: `#${p.num}`, color: 'yellow' }, { t: `  ${p.branch} → ${p.base}`, dim: true }, ...flags], [{ t: p.author, dim: true }], cols))
-    out.push(fit([{ t: p.title, bold: true }], [], cols))
+    out.push(field('브랜치', [{ t: `${p.branch} → ${p.base}` }, ...flags]), field('작성자', [{ t: p.author }]))
     // 리뷰어마다 마지막 리뷰 하나. 새 커밋 전에 남긴 리뷰는 흐리게 그린다.
     const last = new Map<string, Review>()
     for (const r of [...p.reviews].sort((x, y) => x.t - y.t)) last.set(r.user, r)
-    for (const r of [...last.values()].slice(-2)) {
-      const color = r.state === 'APPROVED' ? 'green' : r.state === 'REQUEST_CHANGES' ? 'red' : undefined
-      out.push(fit([{ t: REVIEW_KO[r.state] ?? r.state, color, ...(r.stale && { dim: true as const }) }, { t: `  ${r.user}`, dim: true }], [{ t: `${dur(now - r.t)} 전${r.stale ? ', 이전 커밋' : ''}`, dim: true }], cols))
-    }
-    if (!last.size && p.requested.length) out.push([{ t: `리뷰 요청: ${p.requested.join(', ')}`, dim: true }])
+    const rows: Seg[][] = [...last.values()].slice(-2).map(r => [
+      { t: `${r.user} ` },
+      { t: REVIEW_KO[r.state] ?? r.state, ...(r.stale ? { dim: true as const } : { color: REVIEW_COLOR[r.state] }) },
+      { t: `  ${dur(now - r.t)} 전${r.stale ? ', 이전 커밋' : ''}`, dim: true },
+    ])
+    if (!rows.length && p.requested.length) rows.push([{ t: `${p.requested.join(', ')} 요청됨`, color: 'yellow' }])
+    rows.forEach((r, i) => out.push(field(i ? '' : '리뷰', r)))
   } else {
-    const run = it.runs[0]
-    out.push(fit([{ t: it.branch, color: 'magenta' }, { t: `  ${run?.sha.slice(0, 7) ?? ''}`, dim: true }], run ? [{ t: `실행 #${run.id}`, dim: true }] : [], cols))
-    out.push(fit([{ t: it.title, bold: true }], [], cols))
+    out.push(field('커밋', [{ t: run ? `${run.sha.slice(0, 7)}  ` : '', dim: true }, { t: it.title }]))
+    if (run) out.push(field('실행', [{ t: `#${run.id}`, dim: true }]))
   }
-  const jobs = jobsOf(it.runs)
-  if (!jobs.length) out.push([{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])
+  const jobs = jobsOf(it.runs).map(j => jobLine(j, it.runs, now))
+  if (!jobs.length) return [...out, field('CI', [{ t: '이 커밋에서 돈 CI가 없습니다', dim: true }])].slice(0, DETAIL_ROWS)
+  // 한 줄에 들어가면 작업을 나란히, 아니면 한 줄에 하나씩 쓴다.
+  const inline = jobs.flatMap((j, i) => (i ? [{ t: '    ' }, ...j] : j))
+  if (width(inline.map(s => s.t).join('')) <= cols - LABEL - 2) return [...out, field('CI', inline)].slice(0, DETAIL_ROWS)
   const room = DETAIL_ROWS - out.length
   const fits = jobs.length > room ? jobs.slice(0, Math.max(0, room - 1)) : jobs
-  for (const j of fits) out.push(fit(jobLine(j, it.runs, now), [], cols))
-  if (fits.length < jobs.length) out.push([{ t: `작업 ${jobs.length - fits.length}개 더`, dim: true }])
+  fits.forEach((j, i) => out.push(fit(field(i ? '' : 'CI', j), [], cols)))
+  if (fits.length < jobs.length) out.push(field('', [{ t: `작업 ${jobs.length - fits.length}개 더`, dim: true }]))
   return out.slice(0, DETAIL_ROWS)
 }
 
@@ -306,7 +317,7 @@ export const register: Register = on => {
     const line = where === 'hidden' && !b.error && !e.props.hasSurvey ? bandLine(items(b, now), now) : undefined
     if (!line) return next(e)
     const { Text } = $.ui.resolve(e)
-    return <Text>{fit(line, [], Math.max(10, e.props.bodyColumns - 1)).map(s => <Text color={s.color} dimColor={s.dim}>{s.t}</Text>)}</Text>
+    return <Text>{fit(line, [], Math.max(10, e.props.bodyColumns - 1)).map(s => <Text color={s.color} dimColor={s.dim} backgroundColor={s.bg}>{s.t}</Text>)}</Text>
   })
 
   // push나 PR 작업 뒤에는 바로 읽고, CI 실행이 만들어질 때쯤 한 번 더 읽는다.
@@ -336,65 +347,85 @@ export const register: Register = on => {
     // 마지막 칸에 글자를 쓰면 줄이 넘어갈 수 있어 한 칸 남긴다.
     const cols = Math.max(20, e.props.bodyColumns - 1)
     const total = Math.max(4, e.props.scroll.bodyRows)
-    const segs = (list: Seg[]) => list.map(s => <Text color={s.color} dimColor={s.dim} weight={s.bold && 'bold'}>{s.t}</Text>)
-    const rule = <Text dimColor>{'─'.repeat(cols)}</Text>
-    const header = fit([{ t: b.repo || '저장소 확인 중', bold: true }], [{ t: b.fetched ? `갱신 ${dur(now - b.fetched)} 전` : '불러오는 중', dim: true }], cols)
+    const segs = (list: Seg[]) => list.map(s => <Text color={s.color} dimColor={s.dim} weight={s.bold && 'bold'} backgroundColor={s.bg}>{s.t}</Text>)
+    const blank = <Text> </Text>
+    const slash = b.repo.lastIndexOf('/')
+    const title: Seg[] = b.repo ? [{ t: b.repo.slice(0, slash + 1), dim: true }, { t: b.repo.slice(slash + 1), bold: true }] : [{ t: '저장소 확인 중', bold: true }]
     // 오류일 때 "불러오는 중"은 맞지 않는다. 원격을 읽었으면 저장소 이름만 두고, 아니면 안내만 그린다.
     if (b.error) {
       return (
         <Box flexDirection="column">
-          {b.repo && <Text>{segs(fit([{ t: b.repo, bold: true }], [], cols))}</Text>}
+          {b.repo && <Text>{segs(fit(title, [], cols))}</Text>}
           <Text dimColor>{b.error}</Text>
         </Box>
       )
     }
 
     const list = items(b, now)
-    // 머리 1줄, 구분선 2줄, 단축키와 안내 2줄, 상세. 패널이 낮으면 상세부터 뺀다.
+    const prs = list.filter(it => it.pull)
+    const brs = list.filter(it => !it.pull)
+    // 열린 PR 구역과 브랜치 구역. 구역 머리와 사이의 빈 줄도 목록 줄로 센다.
+    type Row = { item: Item } | { segs: Seg[] }
+    const rows: Row[] = [
+      ...(prs.length ? [{ segs: section(`열린 PR ${prs.length}`, cols) }, ...prs.map(item => ({ item }))] : []),
+      ...(prs.length && brs.length ? [{ segs: [] }] : []),
+      ...(brs.length ? [{ segs: section(`브랜치 ${brs.length}`, cols) }, ...brs.map(item => ({ item }))] : []),
+    ]
+    // 머리 1줄, 빈 줄과 상세, 빈 줄과 단축키. 패널이 낮으면 상세부터 뺀다.
     const hasActions = total >= 10
-    const hasDetail = total >= 16
-    const room = Math.max(1, total - 2 - (hasActions ? 2 : 0) - (hasDetail ? DETAIL_ROWS + 1 : 0))
-    const shown = list.length > room ? list.slice(0, Math.max(1, room - 1)) : list
+    const hasDetail = total >= 18 && list.length > 0
+    const room = Math.max(2, total - 1 - (hasDetail ? DETAIL_ROWS + 1 : 0) - (hasActions ? 2 : 0))
+    const shown = rows.length > room ? rows.slice(0, room - 1) : rows
+    const hidden = list.length - shown.filter(r => 'item' in r).length
     const cur = list.find(it => it.key === v.cur) ?? list[0]
-    const ring = shown.some(it => it.key === cur?.key) ? cur?.key : shown[0]?.key
+    const first = shown.find((r): r is { item: Item } => 'item' in r)?.item
+    const ring = shown.some(r => 'item' in r && r.item.key === cur?.key) ? cur?.key : first?.key
+    const widths = { pr: nameWidth(prs), br: nameWidth(brs) }
     const press = async (it: Item) => {
       void focusPane($, `r:${it.key}`)
       await update($, view, () => ({ cur: it.key }))
     }
-    const act = (hotkey: string, label: string, onPress: () => unknown) => (
-      <Button key={`act:${hotkey}`} plain hotkey={hotkey} onPress={() => void focusPane($).catch(() => {}).then(() => onPress())}>{label}</Button>
+    // 단축키는 테두리가 있는 버튼으로 그린다(plain 버튼은 엔진이 "1:"을 앞에 붙인다). 커서 줄에서 쓸 수 없는 것은 흐리게 둔다.
+    const act = (hotkey: string, label: string, usable: boolean, onPress: () => unknown) => (
+      <Button key={`act:${hotkey}`} hotkey={hotkey} onPress={() => void focusPane($).catch(() => {}).then(() => onPress())}>
+        <Text color="suggestion" weight="bold" dimColor={!usable}>{hotkey}</Text>
+        <Text dimColor={!usable}>{` ${label}`}</Text>
+      </Button>
     )
-    const gap = <Text>  </Text>
-    const hint: Seg[] = e.props.isFocused
-      ? [{ t: '↑↓ 이동  Esc 입력창으로  ctrl+x x 닫기', dim: true }]
-      : [{ t: 'ctrl+x tab', color: 'cyan' }, { t: ' 또는 클릭으로 들어오기  ', dim: true }, { t: '/pr-board', color: 'cyan' }]
+    const gap = <Text> </Text>
+    const failed = !!cur && jobsOf(cur.runs).some(j => j.state === 'failure')
+    const hint = cols >= 70 ? (e.props.isFocused ? 'Esc 나가기' : 'ctrl+x tab') : ''
 
     return (
       <Box flexDirection="column">
-        <Text>{segs(header)}</Text>
-        {rule}
+        <Text>{segs(fit(title, [{ t: b.fetched ? `갱신 ${dur(now - b.fetched)} 전` : '불러오는 중', dim: true }], cols))}</Text>
         {!list.length && b.fetched > 0 && <Text dimColor>열린 PR이 없고, 하루 안에 CI가 돈 브랜치도 없습니다</Text>}
-        {shown.map(it => {
+        {shown.map(r => {
+          if (!('item' in r)) return r.segs.length ? <Text>{segs(r.segs)}</Text> : blank
+          const it = r.item
           const ci = ciOf(it.runs, now)
-          const review = it.pull && reviewOf(it.pull)
-          const mark: Seg = it.current ? { t: '● ', color: 'cyan' } : { t: '  ' }
-          const line = fit([mark, ...labelOf(it)], [...ci.segs, ...(review ? [{ t: '  ' }, review] : [])], cols)
+          const line = fit(rowLeft(it, ci, it.pull ? widths.pr : widths.br), rowRight(ci, it.pull && reviewOf(it.pull)), cols)
+          // 커서 줄은 배경을 깔고, 배경 위에서 잘 보이도록 흐린 글자를 보통 글자로 그린다.
+          const drawn = it.key === cur?.key ? line.map(({ dim, ...s }) => ({ ...s, bg: SEL_BG })) : line
           return (
             <Button key={`r:${it.key}`} plain autoFocus={it.key === ring || undefined} onPress={() => void press(it)}>
-              {segs(line)}
+              {segs(drawn)}
             </Button>
           )
         })}
-        {shown.length < list.length && <Text dimColor>{`  외 ${list.length - shown.length}개`}</Text>}
-        {hasDetail && rule}
+        {hidden > 0 && <Text dimColor>{`  외 ${hidden}개`}</Text>}
+        {hasDetail && blank}
         {hasDetail && detailLines(cur, now, cols).map(l => <Text>{segs(l)}</Text>)}
+        {hasActions && blank}
         {hasActions && (
-          <Box flexDirection="row">
-            {act('1', '리뷰 반영', () => ask($, 'review'))}{gap}{act('2', 'CI 고치기', () => ask($, 'fix'))}{gap}
-            {act('3', '머지', () => ask($, 'merge'))}{gap}{act('r', '새로 고침', () => refresh($, true))}
+          <Box flexDirection="row" justifyContent="space-between" width={cols}>
+            <Box flexDirection="row">
+              {act('1', '리뷰 반영', !!cur?.pull, () => ask($, 'review'))}{gap}{act('2', 'CI 고치기', failed, () => ask($, 'fix'))}{gap}
+              {act('3', '머지', !!cur?.pull, () => ask($, 'merge'))}{gap}{act('r', '새로 고침', true, () => refresh($, true))}
+            </Box>
+            {hint && <Text dimColor>{hint}</Text>}
           </Box>
         )}
-        {hasActions && <Text>{segs(fit(hint, [], cols))}</Text>}
       </Box>
     )
   })

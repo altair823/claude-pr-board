@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { bandLine, ciOf, items, parseRemote, parseRuns, reviewOf } from '../hooks/board'
-import type { Board, Pull } from '../types'
+import { bandLine, ciOf, items, jobLine, parseJobs, parseRemote, parseRuns, reviewOf } from '../hooks/board'
+import type { Board, Pull, Run } from '../types'
 
 // 시험 환경에는 있지만 타입 정의(lib)에는 없는 전역 함수
 declare const setTimeout: (fn: (value?: unknown) => void, ms: number) => unknown
@@ -102,6 +102,11 @@ const PANE = (surface: 'terminal' | 'desktop') => ({
   props: { title: 'PR', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 24 }, view: {} },
 }) as const
 const settle = () => new Promise(r => setTimeout(r, 30))
+// 목록 줄의 상태 기호와 시간 열
+const ciText = (runs: Run[]) => {
+  const c = ciOf(runs, NOW)
+  return `${c.mark.t} ${c.note.t}`
+}
 
 test('원격 주소에서 호스트와 저장소를 읽는다', () => {
   expect(parseRemote('https://gitea.altair823.xyz/altair823-org/claude-pr-board.git')).toEqual({ host: 'gitea.altair823.xyz', repo: 'altair823-org/claude-pr-board' })
@@ -120,7 +125,7 @@ test('열린 PR 줄과 PR이 없는 브랜치 줄을 만들고, 하루가 지난
   // PR 줄은 PR 끝 커밋에서 돈 실행 가운데 워크플로마다 가장 새 것(PR 이벤트로 돈 30번)
   expect(list[0]!.runs.map(r => r.id)).toEqual([30])
   expect(list[2]!.current).toBe(true)
-  expect(ciOf(list[1]!.runs, NOW).segs.map(s => s.t).join('')).toBe('⏳ ci.yml 대기 12분')
+  expect(ciText(list[1]!.runs)).toBe('◌ 대기 12분')
 })
 
 test('앞 작업이 끝나야 시작하는 작업은 그 뒤부터 기다린 시간을 센다', () => {
@@ -129,7 +134,20 @@ test('앞 작업이 끝나야 시작하는 작업은 그 뒤부터 기다린 시
     { name: 'test', state: 'success', created: Date.parse(at('09:00')), started: Date.parse(at('09:01')), done: Date.parse(at('09:44')) },
     { name: 'release', state: 'queued', created: Date.parse(at('09:00')), started: 0, done: 0 },
   ]
-  expect(ciOf([r!], NOW).segs.map(s => s.t).join('')).toBe('⏳ release 대기 16분')
+  expect(ciText([r!])).toBe('◌ 대기 16분')
+})
+
+test('앞 작업을 기다리는 작업(Gitea 28의 pending)은 러너 대기와 구분한다', () => {
+  const [r] = parseRuns({ workflow_runs: [run(1, { status: 'in_progress', conclusion: null, created_at: at('09:50'), started_at: at('09:51') })] })
+  r!.jobs = parseJobs({
+    jobs: [
+      job('test', { status: 'in_progress', conclusion: null, created_at: at('09:50'), started_at: at('09:51'), completed_at: null }),
+      job('release', { status: 'pending', conclusion: null, created_at: at('09:50'), started_at: null, completed_at: null }),
+    ],
+  })
+  expect(ciText([r!])).toBe('▶ test 9분')
+  expect(jobLine(r!.jobs[1]!, [r!], NOW).map(s => s.t).join('')).toBe('◌ release  test 뒤')
+  expect(ciOf([r!], NOW).active).toBe(true)
 })
 
 test('리뷰는 리뷰어마다 마지막 결정을 보고, 새 커밋 전 리뷰는 요청 대기로 본다', () => {
@@ -147,21 +165,27 @@ test('패널에 PR과 브랜치의 CI, 리뷰를 그리고 커서 줄의 작업�
   await settle()
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(PANE(surface))
-    expect((await ui.find({ key: 'r:pr:12' }))?.text).toMatch(/^ {2}#12 로그인 화면 +▶ lint 7분  승인$/)
-    expect((await ui.find({ key: 'r:br:feat/queue' }))?.text).toMatch(/^ {2}feat\/queue {2}커밋 29 +⏳ test 대기 12분$/)
-    expect((await ui.find({ key: 'r:br:main' }))?.text).toMatch(/^● main {2}커밋 28 +✓ 57분 전$/)
+    // 구역마다 상태 기호, 줄 이름, 제목, 시간 열, 리뷰 열. 브랜치 이름은 구역 안에서 폭을 맞춘다.
+    expect((await ui.find({ type: 'Text', text: /^열린 PR 1 ─/ }))).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /^브랜치 2 ─/ }))).toBeDefined()
+    expect((await ui.find({ key: 'r:pr:12' }))?.text).toMatch(/^ {2}▶ #12 {2}로그인 화면 +lint 7분 +승인$/)
+    expect((await ui.find({ key: 'r:br:feat/queue' }))?.text).toMatch(/^ {2}◌ feat\/queue {2}커밋 29 +대기 12분 *$/)
+    expect((await ui.find({ key: 'r:br:main' }))?.text).toMatch(/^● ✓ main {8}커밋 28 +57분 전 *$/)
     expect(await ui.find({ key: 'r:br:old/branch' })).toBeUndefined()
     // 커서가 없으면 첫 줄(PR)의 상세
-    expect((await ui.find({ type: 'Text', text: /feat\/login → main/ }))?.text).toMatch(/altair823$/)
-    expect((await ui.find({ type: 'Text', text: /^승인 +claude-reviewer-01/ }))?.text).toMatch(/5분 전$/)
-    expect((await ui.find({ type: 'Text', text: /^✓ test/ }))?.text.trim()).toBe('✓ test  1분')
-    expect((await ui.find({ type: 'Text', text: /^▶ lint {2}/ }))?.text.trim()).toBe('▶ lint  7분째')
+    expect((await ui.find({ type: 'Text', text: /^#12 ─/ }))).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /브랜치 +feat\/login → main/ }))).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /작성자 +altair823/ }))).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /리뷰 +claude-reviewer-01 승인 {2}5분 전/ }))).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /CI +✓ test/ }))?.text.trim()).toBe('CI      ✓ test  1분    ▶ lint  7분째')
     await ui.unmount()
   }
   await $.ui.focus({ component: 'Pane', requestId: 'pr-board', element: 'r:br:main', origin: { kind: 'person' } })
   const ui = await $.ui.mount(PANE('terminal'))
-  expect((await ui.find({ type: 'Text', text: /^main {2}c{7}/ }))?.text).toMatch(/실행 #28$/)
-  expect((await ui.find({ type: 'Text', text: /release/ }))?.text.trim()).toBe('- release  건너뜀')
+  expect((await ui.find({ type: 'Text', text: /^main ─/ }))).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /커밋 +c{7} {2}커밋 28/ }))).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /실행 +#28/ }))).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /CI +✓ test/ }))?.text.trim()).toBe('CI      ✓ test  2분    - release  건너뜀')
   await ui.unmount()
   // 끝난 실행의 작업은 다시 읽지 않는다
   const before = seen.api.filter(p => p.endsWith('/28/jobs')).length
@@ -241,7 +265,7 @@ test('패널이 다른 탭에 가려지면 입력창 위에 CI 요약을 그리�
   expect(await band($)).toBeUndefined()
   seen.shown = false
   await clock.advance(2000)
-  expect(await band($)).toBe('CI ▶ #12 7분  ⏳ feat/queue 대기 12분')
+  expect(await band($)).toBe('CI ▶ #12 lint 7분  ◌ feat/queue 대기 12분')
   seen.closed = true
   await clock.advance(2000)
   expect(await band($)).toBeUndefined()
@@ -338,6 +362,12 @@ test('같은 저장소를 보는 다른 세션이 최근에 읽은 결과가 있
   expect(lists()).toBe(3)
 })
 
-test('CI 요약은 보여 줄 것이 없으면 비운다', () => {
+test('CI 요약은 지금 브랜치를 먼저 쓰고 나머지는 개수만 세며, 보여 줄 것이 없으면 비운다', () => {
   expect(bandLine([], NOW)).toBeUndefined()
+  const data = fixture()
+  const runs = parseRuns({ workflow_runs: data.runs })
+  for (const r of runs) r.jobs = parseJobs({ jobs: data.jobs[r.id] ?? [] })
+  const pulls: Pull[] = [{ num: 12, title: '로그인 화면', branch: 'feat/login', base: 'main', sha: SHA.pr, author: 'me', draft: false, mergeable: true, updated: 0, requested: [], reviews: [] }]
+  const list = items({ host: 'h', repo: 'org/app', branch: 'feat/login', pulls, runs, fetched: NOW }, NOW)
+  expect(bandLine(list, NOW)?.map(s => s.t).join('')).toBe('● #12 ▶ lint 7분    다른 줄 대기 1')
 })

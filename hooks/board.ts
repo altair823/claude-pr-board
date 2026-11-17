@@ -1,7 +1,7 @@
 // Gitea API 응답을 목록 줄로 바꾸는 순수 함수 모음. 화면과 갱신은 register.tsx에 있다.
 import type { Board, CiState, Job, Pull, Review, Run } from '../types'
 
-export type Seg = { t: string; color?: string; dim?: true; bold?: true }
+export type Seg = { t: string; color?: string; dim?: true; bold?: true; bg?: string }
 
 // 목록 한 줄: 열린 PR, 또는 PR이 없는 브랜치. runs는 그 줄의 마지막 커밋에서 돈 실행(워크플로마다 가장 새 것).
 export type Item = {
@@ -14,8 +14,9 @@ export type Item = {
   current: boolean
 }
 
-// CI 요약. active는 대기 중이거나 실행 중인 작업이 있는지(상태줄과 끝남 알림에 쓴다).
-export type Ci = { state: CiState; active: boolean; segs: Seg[]; since: number }
+// CI 요약. active는 아직 끝나지 않은 작업이 있는지(조회 주기와 끝남 알림에 쓴다).
+// mark는 줄 맨 앞의 상태 기호, note는 오른쪽 시간 열에 쓰는 말이다.
+export type Ci = { state: CiState; active: boolean; mark: Seg; note: Seg; since: number }
 
 const DAY = 24 * 3600_000
 
@@ -30,8 +31,12 @@ export function stateOf(status: unknown, conclusion?: unknown): CiState {
     return conclusion === 'cancelled' ? 'cancelled' : conclusion === 'skipped' ? 'skipped' : 'success'
   }
   if (status === 'in_progress' || status === 'running') return 'running'
-  return status === 'queued' || status === 'waiting' || status === 'pending' || status === 'blocked' ? 'queued' : 'none'
+  if (status === 'queued') return 'queued'
+  // 앞 작업(needs)이 끝나기를 기다리는 작업. Gitea 28은 pending, 1.26까지는 waiting으로 준다.
+  return status === 'pending' || status === 'waiting' || status === 'blocked' ? 'blocked' : 'none'
 }
+
+export const isLive = (s: CiState) => s === 'queued' || s === 'running' || s === 'blocked'
 
 // tea api 출력. 성공하면 JSON 값, API 오류면 그 메시지를 담은 Error를 던진다(tea는 오류에도 종료 코드 0을 낸다).
 export function parseJson(out: string): unknown {
@@ -138,7 +143,7 @@ export function items(b: Board, now: number): Item[] {
   for (const [branch, list] of byBranch) {
     const head = list[0]!
     const mine = latest(list.filter(r => r.sha === head.sha))
-    const active = mine.some(r => r.state === 'queued' || r.state === 'running')
+    const active = mine.some(r => isLive(r.state))
     if (!active && now - head.created > DAY && branch !== b.branch) continue
     out.push({ key: `br:${branch}`, num: 0, branch, title: head.title, runs: mine, current: branch === b.branch })
   }
@@ -179,48 +184,79 @@ export function waitFrom(job: Job, runs: Run[]): number {
 const names = (jobs: Job[]) => (jobs.length > 1 ? `${jobs[0]!.name} 외 ${jobs.length - 1}개` : (jobs[0]?.name ?? ''))
 
 export function ciOf(runs: Run[], now: number): Ci {
-  if (!runs.length) return { state: 'none', active: false, segs: [{ t: 'CI 없음', dim: true }], since: 0 }
+  if (!runs.length) return { state: 'none', active: false, mark: { t: '-', dim: true }, note: { t: 'CI 없음', dim: true }, since: 0 }
   const jobs = jobsOf(runs)
   const of = (s: CiState) => jobs.filter(j => j.state === s)
   const [failed, running, queued] = [of('failure'), of('running'), of('queued')]
-  const active = running.length + queued.length > 0
-  if (failed.length) return { state: 'failure', active, segs: [{ t: `✗ ${names(failed)}`, color: 'red' }], since: 0 }
+  const active = jobs.some(j => isLive(j.state))
+  if (failed.length) return { state: 'failure', active, mark: { t: '✗', color: 'red' }, note: { t: `${names(failed)} 실패`, color: 'red' }, since: 0 }
   if (running.length) {
     const since = Math.min(...running.map(j => j.started || now))
-    return { state: 'running', active, segs: [{ t: `▶ ${names(running)}`, color: 'cyan' }, { t: ` ${dur(now - since)}`, dim: true }], since }
+    return { state: 'running', active, mark: { t: '▶', color: 'cyan' }, note: { t: `${names(running)} ${dur(now - since)}`, dim: true }, since }
   }
   if (queued.length) {
     const since = Math.min(...queued.map(j => waitFrom(j, runs)))
-    return { state: 'queued', active, segs: [{ t: `⏳ ${names(queued)} 대기`, color: 'yellow' }, { t: ` ${dur(now - since)}`, dim: true }], since }
+    return { state: 'queued', active, mark: { t: '◌', color: 'yellow' }, note: { t: `대기 ${dur(now - since)}`, color: 'yellow' }, since }
   }
-  if (of('cancelled').length) return { state: 'cancelled', active, segs: [{ t: '⊘ 취소', dim: true }], since: 0 }
+  // 앞 작업이 막 끝나 다음 작업이 아직 대기열에 들어가지 않은 짧은 순간
+  if (active) return { state: 'queued', active, mark: { t: '◌', dim: true }, note: { t: '다음 작업 준비', dim: true }, since: now }
+  if (of('cancelled').length) return { state: 'cancelled', active, mark: { t: '⊘', dim: true }, note: { t: '취소', dim: true }, since: 0 }
   const done = Math.max(...jobs.map(j => j.done))
-  return { state: 'success', active, segs: [{ t: '✓', color: 'green' }, ...(done ? [{ t: ` ${dur(now - done)} 전`, dim: true as const }] : [])], since: done }
+  return { state: 'success', active, mark: { t: '✓', color: 'green' }, note: { t: done ? `${dur(now - done)} 전` : '', dim: true }, since: done }
 }
 
-// 상세의 작업 한 줄
+// 상세의 작업 하나. 앞 작업을 기다리는 작업은 러너 대기와 구분해 무엇 뒤에 도는지 보여 준다.
 export function jobLine(j: Job, runs: Run[], now: number): Seg[] {
-  if (j.state === 'queued') return [{ t: '⏳ ', color: 'yellow' }, { t: j.name }, { t: `  대기 ${dur(now - waitFrom(j, runs))}`, dim: true }]
+  if (j.state === 'queued') return [{ t: '◌ ', color: 'yellow' }, { t: j.name }, { t: `  대기 ${dur(now - waitFrom(j, runs))}`, dim: true }]
   if (j.state === 'running') return [{ t: '▶ ', color: 'cyan' }, { t: j.name }, { t: `  ${dur(now - (j.started || now))}째`, dim: true }]
+  if (j.state === 'blocked') {
+    const ahead = (runs.find(r => r.jobs?.includes(j))?.jobs ?? []).filter(x => x.state === 'running' || x.state === 'queued')
+    return [{ t: `◌ ${j.name}  ${ahead.length === 1 ? ahead[0]!.name : '앞 작업'} 뒤`, dim: true }]
+  }
   if (j.state === 'skipped') return [{ t: `- ${j.name}  건너뜀`, dim: true }]
   const icon: Seg = j.state === 'failure' ? { t: '✗ ', color: 'red' } : j.state === 'cancelled' ? { t: '⊘ ', dim: true } : { t: '✓ ', color: 'green' }
   return [icon, { t: j.name }, ...(j.started && j.done ? [{ t: `  ${dur(j.done - j.started)}`, dim: true as const }] : [])]
 }
 
-// 줄 이름: PR은 번호와 제목, 브랜치는 이름.
-export const labelOf = (it: Item): Seg[] =>
-  it.pull ? [{ t: `#${it.num}`, color: 'yellow' }, { t: ` ${it.title}` }] : [{ t: it.branch, color: 'magenta' }, { t: `  ${it.title}`, dim: true }]
+const COL = 10
+const padR = (s: Seg, n: number): Seg => ({ ...s, t: s.t + ' '.repeat(Math.max(0, n - width(s.t))) })
+const padL = (s: Seg, n: number): Seg => ({ ...s, t: ' '.repeat(Math.max(0, n - width(s.t))) + s.t })
 
-// 입력창 위 CI 요약: 대기 중이거나 실행 중인 줄과, 지금 브랜치가 실패했으면 그것까지. 보여 줄 것이 없으면 undefined.
+// 구역 머리: 이름 뒤로 줄을 긋는다.
+export const section = (label: string, cols: number): Seg[] => [
+  { t: `${label} `, dim: true, bold: true },
+  { t: '─'.repeat(Math.max(0, cols - width(label) - 1)), color: 'subtle' },
+]
+
+// 줄 이름(PR 번호나 브랜치 이름)의 폭. 같은 구역 안에서 제목이 같은 열에서 시작하게 맞춘다.
+export const nameWidth = (list: Item[]) => Math.min(24, Math.max(0, ...list.map(it => width(it.pull ? `#${it.num}` : it.branch))) + 2)
+
+// 목록 한 줄의 왼쪽: 지금 브랜치 표시, 상태 기호, 줄 이름, 제목
+export function rowLeft(it: Item, ci: Ci, w: number): Seg[] {
+  const mark: Seg = it.current ? { t: '● ', color: 'cyan' } : { t: '  ' }
+  return [mark, ci.mark, { t: ' ' }, padR({ t: it.pull ? `#${it.num}` : it.branch }, w), { t: it.title, ...(!it.pull && { dim: true as const }) }]
+}
+
+// 오른쪽: 시간 열과 리뷰 열. 리뷰가 없는 줄도 리뷰 열을 비워 두어 시간 열을 맞춘다.
+export const rowRight = (ci: Ci, review: Seg | undefined): Seg[] => [padL(ci.note, COL), padL(review ?? { t: '' }, COL)]
+
+const nameOf = (it: Item) => (it.pull ? `#${it.num}` : it.branch)
+
+// 입력창 위 CI 요약. 지금 브랜치가 돌고 있거나 실패했으면 그것을 먼저 쓰고 나머지는 개수만 센다.
+// 지금 브랜치에 보여 줄 것이 없으면 도는 줄을 하나씩 쓴다. 보여 줄 것이 없으면 undefined.
 export function bandLine(list: Item[], now: number): Seg[] | undefined {
-  const parts: Seg[][] = []
-  for (const it of list) {
-    const ci = ciOf(it.runs, now)
-    const name: Seg = { t: it.pull ? `#${it.num}` : it.branch }
-    if (ci.state === 'failure' && (ci.active || it.current)) parts.push([{ t: '✗ ', color: 'red' }, name])
-    else if (ci.state === 'running') parts.push([{ t: '▶ ', color: 'cyan' }, name, { t: ` ${dur(now - ci.since)}`, dim: true }])
-    else if (ci.state === 'queued') parts.push([{ t: '⏳ ', color: 'yellow' }, name, { t: ` 대기 ${dur(now - ci.since)}`, dim: true }])
+  const cur = list.find(it => it.current)
+  const ci = cur && ciOf(cur.runs, now)
+  const others = list.filter(it => it !== cur).map(it => ({ it, ci: ciOf(it.runs, now) }))
+  if (cur && ci && (ci.active || ci.state === 'failure')) {
+    const count = (s: CiState) => others.filter(o => o.ci.state === s).length
+    const [run, wait] = [count('running'), count('queued')]
+    const rest: Seg[] = run + wait ? [{ t: '    다른 줄', dim: true }, ...(run ? [{ t: ` 실행 ${run}`, color: 'cyan' }] : []), ...(wait ? [{ t: ` 대기 ${wait}`, color: 'yellow' }] : [])] : []
+    return [{ t: '● ', color: 'cyan' }, { t: `${nameOf(cur)} ` }, ci.mark, { t: ' ' }, ci.note, ...rest]
   }
+  const parts = others
+    .filter(o => o.ci.state === 'running' || o.ci.state === 'queued' || (o.ci.state === 'failure' && o.ci.active))
+    .map(o => [o.ci.mark, { t: ` ${nameOf(o.it)} ` }, o.ci.note])
   return parts.length ? [{ t: 'CI ', dim: true }, ...parts.flatMap((p, i) => (i ? [{ t: '  ' }, ...p] : p))] : undefined
 }
 

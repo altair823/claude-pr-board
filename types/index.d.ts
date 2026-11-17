@@ -1,5 +1,6 @@
-// CI 상태를 한 가지로 줄인 것. skipped는 조건이 맞지 않아 건너뛴 작업이고, none은 실행이 없거나 알 수 없는 상태다.
-export type CiState = 'queued' | 'running' | 'success' | 'failure' | 'cancelled' | 'skipped' | 'none'
+// CI 상태를 한 가지로 줄인 것. queued는 러너를 기다리는 작업, blocked는 앞 작업(needs)이 끝나기를 기다리는 작업,
+// skipped는 조건이 맞지 않아 건너뛴 작업이고, none은 실행이 없거나 알 수 없는 상태다.
+export type CiState = 'queued' | 'blocked' | 'running' | 'success' | 'failure' | 'cancelled' | 'skipped' | 'none'
 
 // 시각은 모두 ms. 아직 일어나지 않았으면 0이다.
 export type Job = { name: string; state: CiState; created: number; started: number; done: number }
